@@ -921,7 +921,7 @@ class VolcanicVolatilityStrategy(Strategy):
         }
         
         # Strategy parameters
-        self.pair_trade_size = 10  # Size for each pair trade
+        self.pair_trade_size = 40  # Size for each pair trade
         self.vol_diff_threshold = 0.03  # 3% difference to trigger trade
         
         # Tracking orders for all products
@@ -1113,27 +1113,30 @@ class VolcanicVolatilityStrategy(Strategy):
             IV_pred = self._get_fair_IV(rock_price, strike_price)
             vol_diff = IV - IV_pred
 
-            # Trade size based on capacity and pair trade size
-            trade_size = min(self.pair_trade_size, max(buy_capacity, sell_capacity))
-            if trade_size < 2:  # Skip if can't trade meaningful size
-                continue
-
             if abs(vol_diff) > self.IV_std[strike_price]*0.5:
                 # check underlying position limit
                 if vol_diff > 0:
-                    # Only sell if we have capacity
-                    if sell_capacity >= trade_size:
-                        # Sell option
-                        price = max(order_depth.buy_orders.keys())
-                        self._add_order(voucher_symbol, price, -trade_size)
-                        options_traded += 1
+                    # Sell option
+                    price = max(order_depth.buy_orders.keys())
+                    self._add_order(voucher_symbol, price, -sell_capacity)
+                    options_traded += 1
                 else:
-                    # Only buy if we have capacity
-                    if buy_capacity >= trade_size:
-                        # Buy option
-                        price = min(order_depth.sell_orders.keys())
-                        self._add_order(voucher_symbol, price, trade_size)
-                        options_traded += 1
+                    # Buy option
+                    price = min(order_depth.sell_orders.keys())
+                    self._add_order(voucher_symbol, price, buy_capacity)
+                    options_traded += 1
+            else:
+                # close option position
+                if current_position > 0:
+                    # Sell option
+                    price = max(order_depth.buy_orders.keys())
+                    self._add_order(voucher_symbol, price, -sell_capacity)
+                    options_traded += 1
+                elif current_position < 0:
+                    # Buy option
+                    price = min(order_depth.sell_orders.keys())
+                    self._add_order(voucher_symbol, price, buy_capacity)
+                    options_traded += 1
 
     def _calculate_simple_delta(self, S, K, T):
         """
