@@ -1126,17 +1126,28 @@ class VolcanicVolatilityStrategy(Strategy):
                     self._add_order(voucher_symbol, price, buy_capacity)
                     options_traded += 1
             elif abs(vol_diff) < self.IV_std[strike_price]*0.5:
+                # close underlying position
+                underlying_position = state.position.get(self.symbol, 0)
+                underlying_max_buy = self.position_limits[self.symbol] - underlying_position
+                underlying_max_sell = self.position_limits[self.symbol] + underlying_position
+                if underlying_position > 0:
+                    # Sell underlying
+                    price = max(state.order_depths[self.symbol].buy_orders.keys())
+                    self._add_order(self.symbol, price, -underlying_max_sell)
+                if underlying_position < 0:
+                    # Buy underlying
+                    price = min(state.order_depths[self.symbol].sell_orders.keys())
+                    self._add_order(self.symbol, price, underlying_max_buy)
+
                 # close option position
                 if current_position > 0:
                     # Sell option
                     price = max(order_depth.buy_orders.keys())
                     self._add_order(voucher_symbol, price, -sell_capacity)
-                    options_traded += 1
-                elif current_position < 0:
+                if current_position < 0:
                     # Buy option
                     price = min(order_depth.sell_orders.keys())
                     self._add_order(voucher_symbol, price, buy_capacity)
-                    options_traded += 1
 
     def _calculate_simple_delta(self, S, K, T):
         """
