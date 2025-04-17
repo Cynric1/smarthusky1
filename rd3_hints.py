@@ -938,7 +938,7 @@ class VolcanicVolatilityStrategy(Strategy):
                        9500: 0.07086358022008606,
                        9750: 0.03165422328766464}
 
-        self.tau = 4 / 252  # 4 days to expiry in years
+        self.tau = 3 / 252  # 4 days to expiry in years
     
     def run(self, state: TradingState) -> tuple[dict[str, list[Order]], int]:
         """
@@ -977,52 +977,50 @@ class VolcanicVolatilityStrategy(Strategy):
         best_ask = min(order_depth.sell_orders.keys())
 
         return (best_bid + best_ask) / 2
-    
+
     def act(self, state: TradingState) -> None:
         """Execute a volatility-based pair trading strategy"""
         # Check if underlying is in the market
         if self.symbol not in state.order_depths:
             return
-            
+
         order_depth = state.order_depths[self.symbol]
         if not order_depth.buy_orders or not order_depth.sell_orders:
             return
-        
+
         # Get current price of the underlying
         rock_price = self.get_mid_price(state, self.symbol)
         if rock_price is None:
             return
-            
+
         # Add to price history for volatility calculation
         self.price_history.append(rock_price)
         if len(self.price_history) > self.max_history_size:
             self.price_history = self.price_history[-self.max_history_size:]
-        
-        # Fixed at 4 days to expiry as specified
-        days_remaining = 4
-        time_to_expiry = days_remaining / 252  # Convert to years (252 trading days)
-        
+
+        time_to_expiry = self.tau
+
         # Calculate realized volatility
         realized_vol = self._get_realized_volatility()
 
         net_delta = self._calculate_net_delta(state, rock_price, time_to_expiry)
-        
+
         # Then, look for volatility arbitrage opportunities
         self._trade_volatility_arbitrage(state, rock_price, time_to_expiry, realized_vol, net_delta)
-    
+
     def _calculate_net_delta(self, state, rock_price, time_to_expiry):
         """Calculate net delta exposure from options without hedging"""
         # Calculate total delta exposure from all options
         net_delta = 0
-        
+
         for voucher_symbol, strike_price in self.vouchers.items():
             # Get current position
             position = state.position.get(voucher_symbol, 0)
-            
+
             # Skip if no position
             if position == 0:
                 continue
-                
+
             # Calculate option delta
             option_price = self.get_mid_price(state, voucher_symbol)
             if option_price is None:
@@ -1031,10 +1029,13 @@ class VolcanicVolatilityStrategy(Strategy):
             option_delta = self._calculate_option_delta(
                 rock_price, strike_price, time_to_expiry, self.risk_free_rate, IV
             )
-            
+
             # Add to net delta exposure
             net_delta += position * option_delta
-            
+
+        underlying_position = state.position.get(self.symbol, 0)
+        net_delta += underlying_position
+
         return net_delta
 
     def _get_fair_IV(self, rock_price, strike_price):
@@ -1055,89 +1056,76 @@ class VolcanicVolatilityStrategy(Strategy):
         """
         Execute volatility arbitrage with contrarian approach for underlying
         """
+        underlying_position = state.position.get(self.symbol, 0)
+        underlying_max_buy = self.position_limits[self.symbol] - underlying_position
+        underlying_max_sell = self.position_limits[self.symbol] + underlying_position
+        if current_net_delta > 0:
+            # If net delta is positive, we want to sell the underlying
+            price = max(state.order_depths[self.symbol].buy_orders.keys())
+            qty = min(underlying_max_sell, abs(current_net_delta))
+            self.sell(price, int(qty))
+        elif current_net_delta < 0:
+            # If net delta is negative, we want to buy the underlying
+            price = min(state.order_depths[self.symbol].sell_orders.keys())
+            qty = min(underlying_max_buy, abs(current_net_delta))
+            self.buy(price, int(qty))
+
         # For each option, estimate implied vol and compare to realized vol
         options_traded = 0
         underlying_trades = []
-        
+
         # Set a maximum of options to trade per round to avoid timeouts
         max_options_per_round = 2
-        
+
         for voucher_symbol, strike_price in self.vouchers.items():
             # Skip if we've already traded enough options this round
             # if options_traded >= max_options_per_round:
             #     break
-                
+
             # Check if this option is in the order book
             if voucher_symbol not in state.order_depths:
                 continue
-                
+
             order_depth = state.order_depths[voucher_symbol]
             if not order_depth.buy_orders or not order_depth.sell_orders:
                 continue
-                
+
             # Get current market price
             option_price = self.get_mid_price(state, voucher_symbol)
             if option_price is None:
                 continue
-                
+
             # Get current position
             current_position = state.position.get(voucher_symbol, 0)
-            
+
             # Calculate position limit remaining
             position_limit = self.position_limits.get(voucher_symbol, 40)
             buy_capacity = position_limit - current_position
             sell_capacity = position_limit + current_position
-            
+
             # Skip if we're at position limits
             if buy_capacity <= 0 and sell_capacity <= 0:
                 continue
-            
-            ####
-            # # Calculate implied volatility using a simple approximation
-            # atm_factor = 0.4  # Approximation factor
-            # implied_vol_approx = option_price / (rock_price * atm_factor * math.sqrt(time_to_expiry))
-            
-            # # Apply a factor based on moneyness
-            # moneyness = rock_price / strike_price
-            # if moneyness > 1.1:  # Deep ITM
-            #     implied_vol_approx *= 1.3
-            # elif moneyness < 0.9:  # Deep OTM
-            #     implied_vol_approx *= 0.7
-            
-            # # Calculate volatility difference
-            # vol_diff = implied_vol_approx - realized_vol
-            ####
+
             IV = self._get_IV(option_price, rock_price, strike_price)
             if IV is None:
                 continue
             IV_pred = self._get_fair_IV(rock_price, strike_price)
             vol_diff = IV - IV_pred
-            
+
             # Trade size based on capacity and pair trade size
             trade_size = min(self.pair_trade_size, max(buy_capacity, sell_capacity))
             if trade_size < 2:  # Skip if can't trade meaningful size
                 continue
-                
-            if abs(vol_diff) > self.IV_std[strike_price]*0.7:
+
+            if abs(vol_diff) > self.IV_std[strike_price]*0.5:
+                # check underlying position limit
                 if vol_diff > 0:
                     # Only sell if we have capacity
                     if sell_capacity >= trade_size:
                         # Sell option
                         price = max(order_depth.buy_orders.keys())
                         self._add_order(voucher_symbol, price, -trade_size)
-                        
-                        # # Calculate approximate delta
-                        # option_delta = self._calculate_simple_delta(rock_price, strike_price, time_to_expiry)
-                        option_delta = self._calculate_option_delta(
-                            rock_price, strike_price, time_to_expiry, self.risk_free_rate, IV
-                        )
-                        
-                        # CONTRARIAN: Instead of buying underlying for hedge, we'll sell it
-                        # This reverses the normal hedging relationship
-                        hedge_size = round(trade_size * option_delta)
-                        if hedge_size != 0:
-                            underlying_trades.append((-int(hedge_size), "Contrarian hedge for " + voucher_symbol))
-                                
                         options_traded += 1
                 else:
                     # Only buy if we have capacity
@@ -1145,79 +1133,8 @@ class VolcanicVolatilityStrategy(Strategy):
                         # Buy option
                         price = min(order_depth.sell_orders.keys())
                         self._add_order(voucher_symbol, price, trade_size)
-                        
-                        # # Calculate approximate delta
-                        # option_delta = self._calculate_simple_delta(rock_price, strike_price, time_to_expiry)
-                        option_delta = self._calculate_option_delta(
-                            rock_price, strike_price, time_to_expiry, self.risk_free_rate, IV
-                        )
-                        
-                        # CONTRARIAN: Instead of selling underlying for hedge, we'll buy it
-                        # This reverses the normal hedging relationship
-                        hedge_size = round(trade_size * option_delta)
-                        if hedge_size != 0:
-                            underlying_trades.append((-int(hedge_size), "Contrarian hedge for " + voucher_symbol))
-                                
                         options_traded += 1
-        
-        # Now apply underlying trades, but with contrarian logic
-        rock_position = state.position.get(self.symbol, 0)
-        rock_limit = self.position_limits.get(self.symbol, 200)
 
-        rock_max_buy = rock_limit - rock_position
-        rock_max_sell = rock_limit + rock_position
-        # hedge delta
-        if self.symbol in state.order_depths:
-            if current_net_delta > 0:
-                price = max(state.order_depths[self.symbol].buy_orders.keys())
-                qty = min(rock_max_sell, abs(current_net_delta))
-                self.sell(price, int(qty))
-            elif current_net_delta < 0:
-
-                price = min(state.order_depths[self.symbol].sell_orders.keys())
-                qty = min(rock_max_buy, abs(current_net_delta))
-                self.buy(price, int(qty))
-
-        # # First, calculate the "normal" delta hedge target
-        # normal_target = -round(current_net_delta)
-        
-        # # Then, invert it for our contrarian approach
-        # # If normal target would be to buy, we'll sell instead and vice versa
-        # contrarian_target = -normal_target
-        
-        # # Limit the target to our position limits
-        # if contrarian_target > rock_limit:
-        #     contrarian_target = rock_limit
-        # elif contrarian_target < -rock_limit:
-        #     contrarian_target = -rock_limit
-            
-        # # Calculate the adjustment needed
-        # adjustment = contrarian_target - rock_position
-        
-        # # Add the specific hedges from our option trades
-        # for hedge_size, reason in underlying_trades:
-        #     adjustment += hedge_size
-            
-        # # Ensure we don't exceed position limits after adding specific hedges
-        # if rock_position + adjustment > rock_limit:
-        #     adjustment = rock_limit - rock_position
-        # elif rock_position + adjustment < -rock_limit:
-        #     adjustment = -rock_limit - rock_position
-            
-        # # Execute the adjustment if significant
-        # min_adjustment = 2
-        # if abs(adjustment) >= min_adjustment:
-        #     if adjustment > 0:  # Need to buy
-        #         order_depth = state.order_depths[self.symbol]
-        #         if order_depth.sell_orders:
-        #             price = min(order_depth.sell_orders.keys())
-        #             self.buy(price, adjustment)
-        #     else:  # Need to sell
-        #         order_depth = state.order_depths[self.symbol]
-        #         if order_depth.buy_orders:
-        #             price = max(order_depth.buy_orders.keys())
-        #             self.sell(price, -adjustment)
-    
     def _calculate_simple_delta(self, S, K, T):
         """
         Calculate a simplified delta for a call option
@@ -1225,69 +1142,62 @@ class VolcanicVolatilityStrategy(Strategy):
         """
         # Very rough heuristic based approximation
         moneyness = S / K
-        
+
         if moneyness > 1.05:  # ITM
             return 0.8
         elif moneyness < 0.95:  # OTM
             return 0.2
         else:  # ATM
             return 0.5
-    
+
     def _add_order(self, symbol, price, quantity):
         """Add an order for a specific product"""
         if symbol not in self.all_orders:
             self.all_orders[symbol] = []
-            
-        self.all_orders[symbol].append(Order(symbol, price, quantity))
-    
-    def _calculate_option_delta(self, S, K, T, r, sigma):
-        """Calculate Black-Scholes delta for a call option"""
 
-        
-        # If almost expired, use intrinsic value delta
-        if T < 0.01:
-            return 1.0 if S > K else 0.0
-            
+        self.all_orders[symbol].append(Order(symbol, price, quantity))
+
+    def _calculate_option_delta(self, S, K, T, r, sigma):
         # Calculate d1 from Black-Scholes formula
         d1 = (math.log(S/K) + (r + sigma**2/2)*T) / (sigma*math.sqrt(T))
-        
+
         # Delta of call option is N(d1)
         return NormalDist().cdf(d1)
-    
+
     def _get_realized_volatility(self):
         """Calculate realized volatility from price history"""
         # Ensure we have enough data
         if len(self.price_history) < 2:
             return 0.2  # Default if not enough data
-            
+
         # Calculate logarithmic returns
         returns = []
         for i in range(1, len(self.price_history)):
             returns.append(math.log(self.price_history[i] / self.price_history[i-1]))
-            
+
         # Calculate standard deviation of returns
         if not returns:
             return 0.2
-            
+
         # Annualize volatility (assuming 252 trading days per year)
         realized_vol = np.std(returns) * math.sqrt(252)
-        
+
         # Ensure reasonable bounds
         return max(0.1, min(0.4, realized_vol))
-    
+
     def save(self):
         """Save strategy state for next round"""
         return {'price_history': self.price_history}
-    
+
     def load(self, data):
         """Load strategy state from previous round"""
         if data is None:
             return
-            
+
         if isinstance(data, dict) and 'price_history' in data:
             self.price_history = data['price_history']
 
-                                                    
+
 class Trader:
     def __init__(self) -> None:
         # Position limits for each product
