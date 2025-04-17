@@ -905,19 +905,19 @@ class VolcanicVolatilityStrategy(Strategy):
         # Voucher (option) symbols and their strike prices
         self.vouchers = {
             Product.VOLCANIC_ROCK_VOUCHER_9500: 9500,
-            Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
-            Product.VOLCANIC_ROCK_VOUCHER_10000: 10000,
-            Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
-            Product.VOLCANIC_ROCK_VOUCHER_10500: 10500
+            # Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
+            # Product.VOLCANIC_ROCK_VOUCHER_10000: 10000,
+            # Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
+            # Product.VOLCANIC_ROCK_VOUCHER_10500: 10500
         }
         # Position limits for each product
         self.position_limits = {
             Product.VOLCANIC_ROCK: min(limit, 200),  # Increased limit for underlying
             Product.VOLCANIC_ROCK_VOUCHER_9500: 40,  # Increased option limits
-            Product.VOLCANIC_ROCK_VOUCHER_9750: 40,
-            Product.VOLCANIC_ROCK_VOUCHER_10000: 40,
-            Product.VOLCANIC_ROCK_VOUCHER_10250: 40,
-            Product.VOLCANIC_ROCK_VOUCHER_10500: 40
+            # Product.VOLCANIC_ROCK_VOUCHER_9750: 40,
+            # Product.VOLCANIC_ROCK_VOUCHER_10000: 40,
+            # Product.VOLCANIC_ROCK_VOUCHER_10250: 40,
+            # Product.VOLCANIC_ROCK_VOUCHER_10500: 40
         }
         
         # Strategy parameters
@@ -1113,7 +1113,7 @@ class VolcanicVolatilityStrategy(Strategy):
             IV_pred = self._get_fair_IV(rock_price, strike_price)
             vol_diff = IV - IV_pred
 
-            if abs(vol_diff) > self.IV_std[strike_price]*0.5:
+            if abs(vol_diff) > self.IV_std[strike_price]:
                 # check underlying position limit
                 if vol_diff > 0:
                     # Sell option
@@ -1125,7 +1125,7 @@ class VolcanicVolatilityStrategy(Strategy):
                     price = min(order_depth.sell_orders.keys())
                     self._add_order(voucher_symbol, price, buy_capacity)
                     options_traded += 1
-            else:
+            elif abs(vol_diff) < self.IV_std[strike_price]*0.5:
                 # close option position
                 if current_position > 0:
                     # Sell option
