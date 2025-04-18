@@ -905,8 +905,8 @@ class VolcanicVolatilityStrategy(Strategy):
         # Voucher (option) symbols and their strike prices
         self.vouchers = {
             Product.VOLCANIC_ROCK_VOUCHER_9500: 9500,
-            # Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
-            # Product.VOLCANIC_ROCK_VOUCHER_10000: 10000,
+            Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
+            Product.VOLCANIC_ROCK_VOUCHER_10000: 10000,
             # Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
             # Product.VOLCANIC_ROCK_VOUCHER_10500: 10500
         }
@@ -914,8 +914,8 @@ class VolcanicVolatilityStrategy(Strategy):
         self.position_limits = {
             Product.VOLCANIC_ROCK: min(limit, 200),  # Increased limit for underlying
             Product.VOLCANIC_ROCK_VOUCHER_9500: 40,  # Increased option limits
-            # Product.VOLCANIC_ROCK_VOUCHER_9750: 40,
-            # Product.VOLCANIC_ROCK_VOUCHER_10000: 40,
+            Product.VOLCANIC_ROCK_VOUCHER_9750: 40,
+            Product.VOLCANIC_ROCK_VOUCHER_10000: 40,
             # Product.VOLCANIC_ROCK_VOUCHER_10250: 40,
             # Product.VOLCANIC_ROCK_VOUCHER_10500: 40
         }
@@ -927,18 +927,28 @@ class VolcanicVolatilityStrategy(Strategy):
         # Tracking orders for all products
         self.all_orders = {}
 
-        self.IV_polyfit_coeffs = {10000: (0.40885067153030474, 0.06725771593150183, 0.13567595603687707),
-                                  10250: (0.3928783411589459, 0.0066146655239981865, 0.12925682159094656),
-                                  10500: (0.34643181457931804, -0.03389989423344853, 0.13174854909831582),
-                                  9500: (0.37504395029910476, 0.4035887454496337, 0.2572686571798061),
-                                  9750: (-0.3815071651307836, -0.3404886131753659, 0.08396393243678542)}
-        self.IV_std = {10000: 0.009595120416814902,
-                       10250: 0.004838485081024744,
-                       10500: 0.007438727094987067,
-                       9500: 0.07086358022008606,
-                       9750: 0.03165422328766464}
-
-        self.tau = 3 / 252  # 4 days to expiry in years
+        self.IV_polyfit_coeffs = {
+            10000: (0.31918784777187775, 0.031010845470092994, 0.13276129561696567),
+            10250: (0.314005460498095, -0.0003088858306615146, 0.13003255467654273),
+            10500: (0.4853390481422235, -0.07715874206061292, 0.1341271334040705),
+            # 9500: (0.5626823911753489, 0.6188948314352529, 0.3115365828886336),
+            9500: (0, 0, 0.15),
+            # 9750: (-0.0353822056835982, -0.09186147950082771, 0.12614308032864555)}
+            9750: (0, 0, 0.125)
+        }
+        self.m_trading_region = {
+            9500: (-0.7, -0.375),
+            9750: (-0.5, -0.325),
+            10000: (-0.35, 0.125),
+        }
+        self.IV_std = {
+            10000: 0.008474570370633957,
+            10250: 0.006851846108287582,
+            10500: 0.019223183823188248,
+            9500: 0.05,  #0.06663112163923171,
+            9750: 0.04,  #0.02579051730565845
+        }
+        self.tau = 5 / 252  # from rd1 expiry = 7 days
     
     def run(self, state: TradingState) -> tuple[dict[str, list[Order]], int]:
         """
@@ -1069,6 +1079,7 @@ class VolcanicVolatilityStrategy(Strategy):
             price = min(state.order_depths[self.symbol].sell_orders.keys())
             qty = min(underlying_max_buy, abs(current_net_delta))
             self.buy(price, int(qty))
+        print(f"PORTFOLIO DELTA: {current_net_delta}")
 
         # For each option, estimate implied vol and compare to realized vol
         options_traded = 0
@@ -1110,6 +1121,18 @@ class VolcanicVolatilityStrategy(Strategy):
             IV = self._get_IV(option_price, rock_price, strike_price)
             if IV is None:
                 continue
+            moneyness = np.log(strike_price / rock_price) / np.sqrt(self.tau)
+            if moneyness < self.m_trading_region[strike_price][0] or moneyness > self.m_trading_region[strike_price][1]:
+                # clear option position if outside trading region
+                if current_position > 0:
+                    # Sell option
+                    price = max(order_depth.buy_orders.keys())
+                    self._add_order(voucher_symbol, price, -sell_capacity)
+                if current_position < 0:
+                    # Buy option
+                    price = min(order_depth.sell_orders.keys())
+                    self._add_order(voucher_symbol, price, buy_capacity)
+                continue
             IV_pred = self._get_fair_IV(rock_price, strike_price)
             vol_diff = IV - IV_pred
 
@@ -1126,19 +1149,6 @@ class VolcanicVolatilityStrategy(Strategy):
                     self._add_order(voucher_symbol, price, buy_capacity)
                     options_traded += 1
             elif abs(vol_diff) < self.IV_std[strike_price]*0.5:
-                # close underlying position
-                underlying_position = state.position.get(self.symbol, 0)
-                underlying_max_buy = self.position_limits[self.symbol] - underlying_position
-                underlying_max_sell = self.position_limits[self.symbol] + underlying_position
-                if underlying_position > 0:
-                    # Sell underlying
-                    price = max(state.order_depths[self.symbol].buy_orders.keys())
-                    self._add_order(self.symbol, price, -underlying_max_sell)
-                if underlying_position < 0:
-                    # Buy underlying
-                    price = min(state.order_depths[self.symbol].sell_orders.keys())
-                    self._add_order(self.symbol, price, underlying_max_buy)
-
                 # close option position
                 if current_position > 0:
                     # Sell option
