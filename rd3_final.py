@@ -1226,20 +1226,20 @@ class VolcanicVolatilityStrategy(Strategy):
         
         # Voucher (option) symbols and their strike prices
         self.vouchers = {
-            Product.VOLCANIC_ROCK_VOUCHER_9500: 9500,
-            Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
+            # Product.VOLCANIC_ROCK_VOUCHER_9500: 9500,
+            # Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
             Product.VOLCANIC_ROCK_VOUCHER_10000: 10000,
-            Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
-            Product.VOLCANIC_ROCK_VOUCHER_10500: 10500
+            # Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
+            # Product.VOLCANIC_ROCK_VOUCHER_10500: 10500
         }
         # Position limits for each product
         self.position_limits = {
             Product.VOLCANIC_ROCK: min(limit, 200),  # Increased limit for underlying
-            Product.VOLCANIC_ROCK_VOUCHER_9500: 40,  # Increased option limits
-            Product.VOLCANIC_ROCK_VOUCHER_9750: 40,
+            # Product.VOLCANIC_ROCK_VOUCHER_9500: 40,  # Increased option limits
+            # Product.VOLCANIC_ROCK_VOUCHER_9750: 40,
             Product.VOLCANIC_ROCK_VOUCHER_10000: 40,
-            Product.VOLCANIC_ROCK_VOUCHER_10250: 40,
-            Product.VOLCANIC_ROCK_VOUCHER_10500: 40
+            # Product.VOLCANIC_ROCK_VOUCHER_10250: 40,
+            # Product.VOLCANIC_ROCK_VOUCHER_10500: 40
         }
         
         # Strategy parameters
