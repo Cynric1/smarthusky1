@@ -1201,7 +1201,7 @@ class VolcanicVolatilityStrategy(Strategy):
         
         # Store price history for realized volatility calculation
         self.price_history = []
-        self.max_history_size = 15  # Balance between accuracy and performance
+        self.max_history_size = 20  # Balance between accuracy and performance
         
         # Risk-free rate (assumed 0 in this environment)
         self.risk_free_rate = 0
@@ -1334,8 +1334,6 @@ class VolcanicVolatilityStrategy(Strategy):
         
         # Follow Pablo for VOLCANIC_ROCK_VOUCHER_9500
         self._follow_pablo(state, Product.VOLCANIC_ROCK_VOUCHER_9500)
-        self._follow_pablo(state, Product.VOLCANIC_ROCK_VOUCHER_10250)
-
         
         # Use original volatility approach for other vouchers
         time_to_expiry = self.tau
@@ -1343,6 +1341,9 @@ class VolcanicVolatilityStrategy(Strategy):
         
         # Don't include rock_price in net_delta calculation for trading
         self._trade_volatility_arbitrage(state, rock_price, net_delta)
+
+    def directional_bet(self, state: TradingState):
+        pass
 
     def _follow_pablo(self, state: TradingState, symbol: str) -> None:
         """Follow Pablo's trades for a specific symbol"""
