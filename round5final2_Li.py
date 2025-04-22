@@ -1,0 +1,2199 @@
+from statistics import NormalDist
+import json
+import numpy as np
+from datamodel import Order, OrderDepth, TradingState, Symbol, Listing, Trade, Observation
+from typing import Any, List, Dict, Tuple
+import jsonpickle
+import math
+from collections import deque
+
+
+class Product:
+    RAINFOREST_RESIN = "RAINFOREST_RESIN"
+    KELP = "KELP"
+    SQUID_INK = "SQUID_INK"
+    CROISSANT = "CROISSANTS"
+    JAM = "JAMS"
+    DJEMBE = "DJEMBES"
+    PICNIC_BASKET1 = "PICNIC_BASKET1"
+    PICNIC_BASKET2 = "PICNIC_BASKET2"
+    VOLCANIC_ROCK = "VOLCANIC_ROCK"
+    VOLCANIC_ROCK_VOUCHER_9500 = "VOLCANIC_ROCK_VOUCHER_9500"
+    VOLCANIC_ROCK_VOUCHER_9750 = "VOLCANIC_ROCK_VOUCHER_9750"
+    VOLCANIC_ROCK_VOUCHER_10000 = "VOLCANIC_ROCK_VOUCHER_10000"
+    VOLCANIC_ROCK_VOUCHER_10250 = "VOLCANIC_ROCK_VOUCHER_10250"
+    VOLCANIC_ROCK_VOUCHER_10500 = "VOLCANIC_ROCK_VOUCHER_10500"
+    MAGNIFICENT_MACARONS = "MAGNIFICENT_MACARONS"
+
+BASKET_COMPOSITIONS = {
+    Product.PICNIC_BASKET1: {
+        Product.CROISSANT: 6,
+        Product.JAM: 3,
+        Product.DJEMBE: 1
+    },
+    Product.PICNIC_BASKET2: {
+        Product.CROISSANT: 4,
+        Product.JAM: 2
+    }
+}
+
+class Logger:
+    def __init__(self) -> None:
+        self.logs = ""
+        self.max_log_length = 3750
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
+
+    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
+        base_length = len(
+            self.to_json(
+                [
+                    self.compress_state(state, ""),
+                    self.compress_orders(orders),
+                    conversions,
+                    "",
+                    "",
+                ]
+            )
+        )
+
+        max_item_length = (self.max_log_length - base_length) // 3
+
+        print(
+            self.to_json(
+                [
+                    self.compress_state(state, self.truncate(state.traderData, max_item_length)),
+                    self.compress_orders(orders),
+                    conversions,
+                    self.truncate(trader_data, max_item_length),
+                    self.truncate(self.logs, max_item_length),
+                ]
+            )
+        )
+
+        self.logs = ""
+
+    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
+        return [
+            state.timestamp,
+            trader_data,
+            self.compress_listings(state.listings),
+            self.compress_order_depths(state.order_depths),
+            self.compress_trades(state.own_trades),
+            self.compress_trades(state.market_trades),
+            state.position,
+            self.compress_observations(state.observations),
+        ]
+
+    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
+        compressed = []
+        for listing in listings.values():
+            compressed.append([listing.symbol, listing.product, listing.denomination])
+        return compressed
+
+    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
+        compressed = {}
+        for symbol, order_depth in order_depths.items():
+            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
+        return compressed
+
+    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
+        compressed = []
+        for arr in trades.values():
+            for trade in arr:
+                compressed.append(
+                    [
+                        trade.symbol,
+                        trade.price,
+                        trade.quantity,
+                        trade.buyer,
+                        trade.seller,
+                        trade.timestamp,
+                    ]
+                )
+        return compressed
+
+    def compress_observations(self, observations: Observation) -> list[Any]:
+        conversion_observations = {}
+        for product, observation in observations.conversionObservations.items():
+            conversion_observations[product] = [
+                observation.bidPrice,
+                observation.askPrice,
+                observation.transportFees,
+                observation.exportTariff,
+                observation.importTariff,
+                observation.sugarPrice,
+                observation.sunlightIndex,
+            ]
+        return [observations.plainValueObservations, conversion_observations]
+
+    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
+        compressed = []
+        for arr in orders.values():
+            for order in arr:
+                compressed.append([order.symbol, order.price, order.quantity])
+        return compressed
+
+    def to_json(self, value: Any) -> str:
+        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
+    def truncate(self, value: str, max_length: int) -> str:
+        lo, hi = 0, min(len(value), max_length)
+        out = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = value[:mid]
+            if len(candidate) < len(value):
+                candidate += "..."
+            encoded_candidate = json.dumps(candidate)
+            if len(encoded_candidate) <= max_length:
+                out = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return out
+
+class ProsperityEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, dict):
+            return {key: self.default(value) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [self.default(item) for item in obj]
+        if hasattr(obj, "__dict__"):
+            return self.default(vars(obj))
+        return obj
+
+class Strategy:
+    def __init__(self, symbol: str, limit: int) -> None:
+        self.symbol = symbol
+        self.limit = limit
+        self.orders = []
+        self.conversions = 0
+
+    def run(self, state: TradingState) -> tuple[list[Order], int]:
+        self.orders = []
+        self.conversions = 0
+        self.act(state)
+        return self.orders, self.conversions
+
+    def buy(self, price: int, quantity: int) -> None:
+        self.orders.append(Order(self.symbol, price, quantity))
+
+    def sell(self, price: int, quantity: int) -> None:
+        self.orders.append(Order(self.symbol, price, -quantity))
+
+    def convert(self, amount: int) -> None:
+        self.conversions += amount
+
+    def act(self, state: TradingState) -> None:
+        raise NotImplementedError()
+
+    def save(self):
+        return None
+
+    def load(self, data):
+        pass
+
+class MarketMakingStrategy(Strategy):
+    def __init__(self, symbol: str, limit: int) -> None:
+        super().__init__(symbol, limit)
+        self.window = deque()
+        self.window_size = 10
+
+    def get_true_value(self, state: TradingState) -> int:
+        raise NotImplementedError()
+
+    def act(self, state: TradingState) -> None:
+        true_value = self.get_true_value(state)
+        order_depth = state.order_depths[self.symbol]
+        buy_orders = sorted(order_depth.buy_orders.items(), reverse=True)
+        sell_orders = sorted(order_depth.sell_orders.items())
+        position = state.position.get(self.symbol, 0)
+        to_buy = self.limit - position
+        to_sell = self.limit + position
+        self.window.append(abs(position) == self.limit)
+        if len(self.window) > self.window_size:
+            self.window.popleft()
+        soft_liquidate = len(self.window) == self.window_size and sum(self.window) >= self.window_size / 2 and self.window[-1]
+        hard_liquidate = len(self.window) == self.window_size and all(self.window)
+        max_buy_price = true_value - 1 if position > self.limit * 0.5 else true_value
+        min_sell_price = true_value + 1 if position < self.limit * -0.5 else true_value
+        for price, volume in sell_orders:
+            if to_buy > 0 and price <= max_buy_price:
+                quantity = min(to_buy, -volume)
+                self.buy(price, quantity)
+                to_buy -= quantity
+        if to_buy > 0 and hard_liquidate:
+            quantity = to_buy // 2
+            self.buy(true_value, quantity)
+            to_buy -= quantity
+        if to_buy > 0 and soft_liquidate:
+            quantity = to_buy // 2
+            self.buy(true_value - 2, quantity)
+            to_buy -= quantity
+        if to_buy > 0:
+            popular_buy_price = max(buy_orders, key=lambda tup: tup[1])[0] if buy_orders else true_value - 2
+            price = min(max_buy_price, popular_buy_price + 1)
+            self.buy(price, to_buy)
+        for price, volume in buy_orders:
+            if to_sell > 0 and price >= min_sell_price:
+                quantity = min(to_sell, volume)
+                self.sell(price, quantity)
+                to_sell -= quantity
+        if to_sell > 0 and hard_liquidate:
+            quantity = to_sell // 2
+            self.sell(true_value, quantity)
+            to_sell -= quantity
+        if to_sell > 0 and soft_liquidate:
+            quantity = to_sell // 2
+            self.sell(true_value + 2, quantity)
+            to_sell -= quantity
+        if to_sell > 0:
+            popular_sell_price = min(sell_orders, key=lambda tup: tup[1])[0] if sell_orders else true_value + 2
+            price = max(min_sell_price, popular_sell_price - 1)
+            self.sell(price, to_sell)
+
+    def save(self):
+        return list(self.window)
+
+    def load(self, data):
+        self.window = deque(data)
+
+class RainforestResinStrategy(MarketMakingStrategy):
+    def get_true_value(self, state: TradingState) -> int:
+        return 10000
+
+class KelpStrategy(MarketMakingStrategy):
+    def __init__(self, symbol: str, limit: int) -> None:
+        super().__init__(symbol, limit)
+        self.adverse_volume_threshold = 28
+        self.price_history = []
+        self.max_history_size = 10
+        self.reversion_beta = -0.2
+        self.last_fair_value = None
+
+    def get_true_value(self, state: TradingState) -> int:
+        order_depth = state.order_depths[self.symbol]
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return 2026
+        best_bid = max(order_depth.buy_orders.keys())
+        best_ask = min(order_depth.sell_orders.keys())
+        mid_price = (best_bid + best_ask) / 2
+        filtered_ask_prices = [
+            price for price in order_depth.sell_orders.keys()
+            if abs(order_depth.sell_orders[price]) >= self.adverse_volume_threshold
+        ]
+        filtered_bid_prices = [
+            price for price in order_depth.buy_orders.keys()
+            if abs(order_depth.buy_orders[price]) >= self.adverse_volume_threshold
+        ]
+        popular_buy_price = max(order_depth.buy_orders.items(), key=lambda tup: tup[1])[0]
+        popular_sell_price = min(order_depth.sell_orders.items(), key=lambda tup: abs(tup[1]))[0]
+        mm_ask = min(filtered_ask_prices) if filtered_ask_prices else popular_sell_price
+        mm_bid = max(filtered_bid_prices) if filtered_bid_prices else popular_buy_price
+        mm_mid_price = (mm_ask + mm_bid) / 2
+        self.price_history.append(mm_mid_price)
+        if len(self.price_history) > self.max_history_size:
+            self.price_history = self.price_history[-self.max_history_size:]
+        if self.last_fair_value is not None:
+            last_returns = (mm_mid_price - self.last_fair_value) / self.last_fair_value
+            pred_returns = last_returns * self.reversion_beta
+            fair_value = mm_mid_price + (mm_mid_price * pred_returns)
+        else:
+            fair_value = mm_mid_price
+        self.last_fair_value = mm_mid_price
+        return round(fair_value)
+
+    def save(self):
+        data = {
+            'window': list(self.window),
+            'price_history': self.price_history,
+            'last_fair_value': self.last_fair_value
+        }
+        return data
+
+    def load(self, data):
+        if isinstance(data, list):
+            self.window = deque(data)
+        elif isinstance(data, dict):
+            if 'window' in data:
+                self.window = deque(data['window'])
+            if 'price_history' in data:
+                self.price_history = data['price_history']
+            if 'last_fair_value' in data:
+                self.last_fair_value = data['last_fair_value']
+                
+class SquidInkStrategy(MarketMakingStrategy):
+    """
+    Modified SquidInk Strategy that follows Charlie's trades
+    """
+    def __init__(self, symbol: str, limit: int) -> None:
+        super().__init__(symbol, limit)
+        
+        # Store Charlie's recent trades
+        self.charlie_recent_trades = []
+        
+        # Max trades to track
+        self.max_trades_history = 100
+        
+        # Name of trader to follow
+        self.trader_to_follow = "Charlie"
+        
+    def get_true_value(self, state: TradingState) -> int:
+        """
+        This is required by parent class but not used in our strategy.
+        We've completely replaced the parent's act method.
+        """
+        return 2500  # Default value, not actually used
+        
+    def act(self, state: TradingState) -> None:
+        """
+        Override parent's act method to follow Charlie instead
+        """
+        # Skip if symbol not in order depths
+        if self.symbol not in state.order_depths:
+            return
+            
+        order_depth = state.order_depths[self.symbol]
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return
+            
+        # Update Charlie's trades from market trades
+        self._update_charlie_trades(state)
+        
+        # Follow Charlie's direction
+        self._follow_charlie_trades(state)
+        
+    def _update_charlie_trades(self, state: TradingState) -> None:
+        """Update database of Charlie's recent trades"""
+        # Skip if no market trades for this symbol
+        if self.symbol not in state.market_trades:
+            return
+            
+        # Get trades for this product
+        trades = state.market_trades[self.symbol]
+        
+        # Filter for Charlie's trades
+        charlie_trades = [
+            trade for trade in trades
+            if trade.buyer == self.trader_to_follow or trade.seller == self.trader_to_follow
+        ]
+        
+        # Add to our tracking
+        if charlie_trades:
+            self.charlie_recent_trades.extend(charlie_trades)
+            
+            # Keep only the most recent trades
+            self.charlie_recent_trades = self.charlie_recent_trades[-self.max_trades_history:]
+    
+    def _follow_charlie_trades(self, state: TradingState) -> None:
+        """Follow Charlie's trades by executing similar trades"""
+        # Skip if no recent trades from Charlie
+        if not self.charlie_recent_trades:
+            return
+            
+        # Calculate Charlie's net position in recent trades
+        charlie_buys = sum(
+            trade.quantity 
+            for trade in self.charlie_recent_trades 
+            if trade.buyer == self.trader_to_follow
+        )
+        
+        charlie_sells = sum(
+            trade.quantity 
+            for trade in self.charlie_recent_trades 
+            if trade.seller == self.trader_to_follow
+        )
+        
+        charlie_net = charlie_buys - charlie_sells
+        
+        # Skip if Charlie has no net position
+        if charlie_net == 0:
+            return
+            
+        # Get current position
+        current_position = state.position.get(self.symbol, 0)
+        
+        # Determine action based on Charlie's net position
+        if charlie_net > 0:
+            # Charlie is net long - we should buy
+            buy_capacity = self.limit - current_position
+            
+            # Skip if no capacity
+            if buy_capacity <= 0:
+                return
+                
+            # Execute buy order
+            order_depth = state.order_depths[self.symbol]
+            if not order_depth.sell_orders:
+                return
+                
+            best_ask = min(order_depth.sell_orders.keys())
+            available_volume = abs(order_depth.sell_orders[best_ask])
+            
+            # Calculate trade size (min of Charlie's position, our capacity, available volume)
+            trade_size = min(abs(charlie_net), buy_capacity, available_volume)
+            
+            if trade_size > 0:
+                self.buy(best_ask, trade_size)
+                
+        else:  # charlie_net < 0
+            # Charlie is net short - we should sell
+            sell_capacity = self.limit + current_position
+            
+            # Skip if no capacity
+            if sell_capacity <= 0:
+                return
+                
+            # Execute sell order
+            order_depth = state.order_depths[self.symbol]
+            if not order_depth.buy_orders:
+                return
+                
+            best_bid = max(order_depth.buy_orders.keys())
+            available_volume = order_depth.buy_orders[best_bid]
+            
+            # Calculate trade size (min of Charlie's position, our capacity, available volume)
+            trade_size = min(abs(charlie_net), sell_capacity, available_volume)
+            
+            if trade_size > 0:
+                self.sell(best_bid, trade_size)
+    
+    def save(self):
+        """Save strategy state for next round"""
+        return {
+            'window': list(self.window),
+            'charlie_recent_trades': self.charlie_recent_trades
+        }
+        
+    def load(self, data):
+        """Load strategy state from previous round"""
+        if isinstance(data, list):
+            # Old format - just the window
+            self.window = deque(data)
+        elif isinstance(data, dict):
+            # New format with Charlie's trades
+            if 'window' in data:
+                self.window = deque(data['window'])
+            if 'charlie_recent_trades' in data:
+                self.charlie_recent_trades = data['charlie_recent_trades']
+                
+class RegressionHedgingStrategy:
+    def __init__(self, state_history_length=30):
+        self.state_history_length = state_history_length
+        self.price_history = {
+            "CROISSANTS": [],
+            "JAMS": [],
+            "DJEMBES": [],
+            "PICNIC_BASKET1": [],
+            "PICNIC_BASKET2": []
+        }
+        self.hedge_coefficients = {
+            "PICNIC_BASKET1": {
+                "CROISSANTS": None,
+                "JAMS": None,
+                "DJEMBES": None
+            },
+            "PICNIC_BASKET2": {
+                "CROISSANTS": None,
+                "JAMS": None
+            }
+        }
+        self.default_compositions = {
+            "PICNIC_BASKET1": {
+                "CROISSANTS": 6,
+                "JAMS": 3,
+                "DJEMBES": 1
+            },
+            "PICNIC_BASKET2": {
+                "CROISSANTS": 4,
+                "JAMS": 2
+            }
+        }
+        self.position_limits = {
+            "CROISSANTS": 250,
+            "JAMS": 350,
+            "DJEMBES": 60,
+            "PICNIC_BASKET1": 60,
+            "PICNIC_BASKET2": 100
+        }
+        self.high_position_threshold = 0.7
+        self.max_hedge_trade_size = 10
+        self.min_hedge_trade_size = 1
+
+    def update_price_history(self, state: TradingState) -> None:
+        for product in self.price_history.keys():
+            if product in state.order_depths:
+                order_depth = state.order_depths[product]
+                if order_depth.buy_orders and order_depth.sell_orders:
+                    best_bid = max(order_depth.buy_orders.keys())
+                    best_ask = min(order_depth.sell_orders.keys())
+                    mid_price = (best_bid + best_ask) / 2
+                    self.price_history[product].append(mid_price)
+                    if len(self.price_history[product]) > self.state_history_length:
+                        self.price_history[product] = self.price_history[product][-self.state_history_length:]
+
+    def update_hedge_coefficients(self) -> None:
+        min_history = 10
+        for basket in ["PICNIC_BASKET1", "PICNIC_BASKET2"]:
+            if len(self.price_history[basket]) < min_history:
+                continue
+            basket_prices = np.array(self.price_history[basket])
+            components = self.default_compositions[basket].keys()
+            component_data = {}
+            all_components_have_data = True
+            for component in components:
+                if len(self.price_history[component]) < min_history:
+                    all_components_have_data = False
+                    break
+                history_length = min(len(self.price_history[basket]), len(self.price_history[component]))
+                component_data[component] = np.array(self.price_history[component][-history_length:])
+            if not all_components_have_data:
+                continue
+            basket_prices = basket_prices[-history_length:]
+            for component in components:
+                component_prices = component_data[component]
+                X = component_prices.reshape(-1, 1)
+                ones = np.ones(len(X))
+                X_with_const = np.column_stack((ones, X))
+                beta = np.linalg.lstsq(X_with_const, basket_prices, rcond=None)[0]
+                self.hedge_coefficients[basket][component] = beta[1]
+
+    def identify_high_positions(self, state: TradingState) -> List[str]:
+        high_position_products = []
+        for product, limit in self.position_limits.items():
+            position = state.position.get(product, 0)
+            position_pct = abs(position) / limit
+            if position_pct >= self.high_position_threshold:
+                high_position_products.append(product)
+        return high_position_products
+
+    def calculate_hedge_trades(
+        self, state: TradingState, high_position_products: List[str]
+    ) -> Dict[str, List[Order]]:
+        hedge_orders = {}
+        for product in high_position_products:
+            position = state.position.get(product, 0)
+            if position == 0:
+                continue
+            is_long = position > 0
+            if product in ["PICNIC_BASKET1", "PICNIC_BASKET2"]:
+                self._hedge_basket_with_components(state, product, is_long, hedge_orders)
+            else:
+                self._hedge_component_with_baskets(state, product, is_long, hedge_orders)
+        return hedge_orders
+
+class ETFArbitrageStrategy(Strategy):
+
+    def __init__(self, symbol: str, limit: int, trader_data_key: str = None) -> None:
+        super().__init__(symbol, limit)
+        self.trader_data_key = trader_data_key or symbol
+
+        self.POSITION_LIMIT = {
+            'PICNIC_BASKET1':
+            {
+                'PICNIC_BASKET1': 20,
+                'CROISSANTS': 125,
+                'JAMS': 180,
+                'DJEMBES': 60,
+            },
+            'PICNIC_BASKET2':
+            {
+                'PICNIC_BASKET2': 30,
+                'CROISSANTS': 125,
+                'JAMS': 180,
+            }
+        }
+
+        # Reserve percentages of position limit for informed trading (guaranteed allocation)
+        self.INFORMED_RESERVE = {
+            'CROISSANTS': 0.60,  # Reserve 40% of position limit for informed trades
+            'JAMS': 0.25,        # Reserve 25% of position limit for informed trades
+            'DJEMBES': 0.35,     # Reserve 35% of position limit for informed trades
+        }
+
+        # Limit pair trading to specified percentage of position limit
+        self.PAIR_TRADING_MAX = {
+            'PICNIC_BASKET1': 0.4,  # Limit basket to 50% of position limit for pair trading
+            'PICNIC_BASKET2': 0.4,  # Limit basket to 50% of position limit for pair trading
+            'CROISSANTS': 0.6,      # Limit to 50% of position limit for pair trading
+            'JAMS': 0.6,            # Limit to 50% of position limit for pair trading
+            'DJEMBES': 0.4,         # Limit to 50% of position limit for pair trading
+        }
+
+        if symbol == Product.PICNIC_BASKET1:
+            self.spread_mean = 7207.985
+            self.spread_std = 46831.587
+        elif symbol == Product.PICNIC_BASKET2:
+            self.spread_mean = 4045.753
+            self.spread_std = 24187.677
+
+        self.components = BASKET_COMPOSITIONS[symbol]
+        self.basket_price_history = []
+        self.component_price_history = []
+        self.component_orders = {component: [] for component in self.components}
+        
+        # Track informed trader information
+        self.informed_traders = {
+            "CROISSANTS": "Olivia",   # Best performer for CROISSANTS
+            "DJEMBES": "Caesar",      # Best performer for DJEMBES
+            "JAMS": "Paris"           # Best performer for JAMS
+        }
+        
+        # Minimum net position threshold to consider an informed trader signal valid
+        self.min_informed_position = {
+            "CROISSANTS": 15,  # Significant activity by Olivia
+            "DJEMBES": 10,     # Significant activity by Caesar
+            "JAMS": 8          # Significant activity by Paris
+        }
+        
+        # Track trend information
+        self.price_history = {symbol: [], **{comp: [] for comp in self.components}}
+        self.max_history_size = 10
+        
+        # Track positions taken based on informed trader signals
+        self.informed_positions = {comp: 0 for comp in self.components}
+        
+        # Track pair trading positions separately
+        self.pair_positions = {symbol: 0, **{comp: 0 for comp in self.components}}
+
+    def get_mid_price(self, state: TradingState, symbol: str) -> float:
+        if symbol not in state.order_depths:
+            return None
+
+        order_depth = state.order_depths[symbol]
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return None
+
+        buy_orders = sorted(order_depth.buy_orders.items(), reverse=True)
+        sell_orders = sorted(order_depth.sell_orders.items())
+
+        best_bid = buy_orders[0][0]
+        best_ask = sell_orders[0][0]
+
+        return (best_bid + best_ask) / 2
+
+    def detect_informed_trader_signal(self, state: TradingState, symbol: str) -> int:
+        """
+        Detect if informed traders are active in the market
+        Returns: 1 for buy signal, -1 for sell signal, 0 for no signal
+        """
+        if symbol not in state.market_trades or not state.market_trades[symbol]:
+            return 0
+        
+        # Check if we have an informed trader for this symbol
+        if symbol not in self.informed_traders:
+            return 0
+            
+        target_trader = self.informed_traders[symbol]
+        min_threshold = self.min_informed_position.get(symbol, 10)
+        
+        # Analyze all recent trades
+        recent_trades = state.market_trades[symbol][-50:]  # Look at more trades for stronger signal
+        
+        # Calculate net position by the target trader over recent history
+        trader_buys = sum(trade.quantity for trade in recent_trades if trade.buyer == target_trader)
+        trader_sells = sum(trade.quantity for trade in recent_trades if trade.seller == target_trader)
+        
+        net_position = trader_buys - trader_sells
+        
+        # Only consider significant activity
+        if abs(net_position) < min_threshold:
+            return 0
+            
+        # Return directional signal
+        if net_position > 0:
+            return 1  # Buy signal
+        else:
+            return -1  # Sell signal
+
+    def calculate_available_capacity(self, state: TradingState, product: str, informed_only=False) -> tuple:
+        """
+        Calculate available capacity for a product, respecting reserved allocations.
+        Returns (long_capacity, short_capacity) tuple
+        """
+        position_limit = self.POSITION_LIMIT[self.symbol].get(product, 0)
+        current_position = state.position.get(product, 0)
+        
+        # Get reserved capacity percentages
+        informed_reserve = self.INFORMED_RESERVE.get(product, 0)
+        pair_max = self.PAIR_TRADING_MAX.get(product, 1.0)
+        
+        # Calculate reserved capacity for informed trading
+        informed_reserved_capacity = int(position_limit * informed_reserve)
+        
+        # Calculate maximum capacity for pair trading
+        pair_max_capacity = int(position_limit * pair_max)
+        
+        # Get current positions
+        informed_position = self.informed_positions.get(product, 0)
+        pair_position = self.pair_positions.get(product, 0)
+        
+        if informed_only:
+            # Only calculate capacity for informed trading
+            long_capacity = min(informed_reserved_capacity - informed_position,
+                                position_limit - current_position)
+            short_capacity = min(informed_reserved_capacity + informed_position,
+                                position_limit + current_position)
+        else:
+            # Calculate capacity for pair trading, respecting informed positions
+            # For long positions:
+            # 1. Respect position limit
+            # 2. Respect pair trading maximum
+            # 3. Leave room for existing informed positions
+            long_capacity = min(position_limit - current_position,
+                               pair_max_capacity - pair_position)
+            
+            # For short positions:
+            short_capacity = min(position_limit + current_position,
+                                pair_max_capacity + pair_position)
+        
+        return max(0, long_capacity), max(0, short_capacity)
+
+    def execute_informed_trader_trades(self, state: TradingState):
+        """Execute separate directional trades based on informed trader signals"""
+        # Only check components that are in our basket
+        for product in self.components:
+            # Skip if we don't have informed trader for this product
+            if product not in self.informed_traders:
+                continue
+                
+            # Get informed trader signal
+            signal = self.detect_informed_trader_signal(state, product)
+            
+            # Skip if no signal
+            if signal == 0:
+                continue
+                
+            # Calculate available capacity for informed trading
+            long_capacity, short_capacity = self.calculate_available_capacity(state, product, informed_only=True)
+            
+            if signal > 0:  # Buy signal
+                if long_capacity <= 0:
+                    continue
+                    
+                # Execute buy order
+                ask_price = min(state.order_depths[product].sell_orders.keys())
+                available_volume = abs(state.order_depths[product].sell_orders[ask_price])
+                trade_size = min(long_capacity, available_volume)
+                
+                if trade_size <= 0:
+                    continue
+                    
+                self.component_orders[product].append(
+                    Order(product, ask_price, trade_size)
+                )
+                
+                # Update our tracking of informed trader positions
+                self.informed_positions[product] += trade_size
+                print(f"INFORMED TRADE: Buying {trade_size} of {product} at {ask_price} (following {self.informed_traders[product]})")
+                
+            elif signal < 0:  # Sell signal
+                if short_capacity <= 0:
+                    continue
+                    
+                # Execute sell order
+                bid_price = max(state.order_depths[product].buy_orders.keys())
+                available_volume = state.order_depths[product].buy_orders[bid_price]
+                trade_size = min(short_capacity, available_volume)
+                
+                if trade_size <= 0:
+                    continue
+                    
+                self.component_orders[product].append(
+                    Order(product, bid_price, -trade_size)
+                )
+                
+                # Update our tracking of informed trader positions
+                self.informed_positions[product] -= trade_size
+                print(f"INFORMED TRADE: Selling {trade_size} of {product} at {bid_price} (following {self.informed_traders[product]})")
+    
+    def unwind_informed_positions(self, state: TradingState):
+        """
+        Unwind informed trader positions when signals reverse or disappear
+        """
+        for product, position in self.informed_positions.items():
+            if position == 0:
+                continue
+                
+            # Get current signal
+            signal = self.detect_informed_trader_signal(state, product)
+            
+            # If signal disappeared or reversed, unwind position
+            if (position > 0 and signal <= 0) or (position < 0 and signal >= 0):
+                if position > 0:
+                    # Sell to unwind long position
+                    if product in state.order_depths and state.order_depths[product].buy_orders:
+                        bid_price = max(state.order_depths[product].buy_orders.keys())
+                        self.component_orders[product].append(
+                            Order(product, bid_price, -position)
+                        )
+                        print(f"UNWINDING: Selling {position} of {product} at {bid_price} (informed signal changed)")
+                        self.informed_positions[product] = 0
+                else:
+                    # Buy to unwind short position
+                    if product in state.order_depths and state.order_depths[product].sell_orders:
+                        ask_price = min(state.order_depths[product].sell_orders.keys())
+                        self.component_orders[product].append(
+                            Order(product, ask_price, -position)
+                        )
+                        print(f"UNWINDING: Buying {-position} of {product} at {ask_price} (informed signal changed)")
+                        self.informed_positions[product] = 0
+
+    def update_pair_positions(self, basket_qty, component_quantities):
+        """Update tracked pair positions when executing trades"""
+        # Update basket position
+        self.pair_positions[self.symbol] += basket_qty
+        
+        # Update component positions
+        for component, qty in component_quantities.items():
+            self.pair_positions[component] += qty
+    
+    def act(self, state: TradingState) -> None:
+        if self.symbol not in state.order_depths:
+            return
+        order_depth = state.order_depths[self.symbol]
+        if not order_depth.sell_orders:
+            return
+        for component in self.components:
+            if component not in state.order_depths:
+                return
+            order_depth = state.order_depths[component]
+            if not order_depth.buy_orders:
+                return
+        
+        # First, check for informed trader signals and execute directional trades
+        self.unwind_informed_positions(state)
+        self.execute_informed_trader_trades(state)
+        
+        # Update price history for each product
+        current_price = self.get_mid_price(state, self.symbol)
+        if current_price is not None:
+            self.price_history[self.symbol].append(current_price)
+            if len(self.price_history[self.symbol]) > self.max_history_size:
+                self.price_history[self.symbol] = self.price_history[self.symbol][-self.max_history_size:]
+                
+        for component in self.components:
+            comp_price = self.get_mid_price(state, component)
+            if comp_price is not None:
+                self.price_history[component].append(comp_price)
+                if len(self.price_history[component]) > self.max_history_size:
+                    self.price_history[component] = self.price_history[component][-self.max_history_size:]
+        
+        # Now proceed with standard pair trading logic
+        
+        # Calculate component price and basket price for pair trading
+        component_price = sum(
+            self.get_mid_price(state, component) * quantity
+            for component, quantity in self.components.items()
+        )
+        basket_price = self.get_mid_price(state, self.symbol)
+        
+        self.basket_price_history.append(basket_price)
+        self.component_price_history.append(component_price)
+        self.basket_price_history = self.basket_price_history[-20:]
+        self.component_price_history = self.component_price_history[-20:]
+        
+        if len(self.basket_price_history) < 20:
+            return
+            
+        # Linear regression to find the hedge ratio
+        hedge_ratio = np.polyfit(
+            self.component_price_history, self.basket_price_history, 1
+        )[0]
+        
+        # Calculate spread and z-score
+        spread = basket_price - hedge_ratio * component_price
+        zscore = (spread - self.spread_mean) / self.spread_std
+        
+        # Position unwinding logic - close pair trade positions when spread is close to mean
+        # Don't unwind informed trader positions
+        if abs(zscore) < 0.3:
+            # Get current pair position for basket
+            basket_pair_position = self.pair_positions[self.symbol]
+            
+            # Close basket pair position
+            if basket_pair_position > 0:
+                basket_ask_price = min(state.order_depths[self.symbol].sell_orders.keys())
+                self.sell(basket_ask_price, basket_pair_position)
+                self.pair_positions[self.symbol] = 0
+                print(f"PAIR UNWIND: Selling {basket_pair_position} of basket at {basket_ask_price}")
+            elif basket_pair_position < 0:
+                basket_bid_price = max(state.order_depths[self.symbol].buy_orders.keys())
+                self.buy(basket_bid_price, -basket_pair_position)
+                self.pair_positions[self.symbol] = 0
+                print(f"PAIR UNWIND: Buying {-basket_pair_position} of basket at {basket_bid_price}")
+                
+            # Close component pair positions
+            for component in self.components:
+                component_pair_position = self.pair_positions.get(component, 0)
+                
+                if component_pair_position > 0:
+                    component_bid_price = max(state.order_depths[component].buy_orders.keys())
+                    self.component_orders[component].append(
+                        Order(component, component_bid_price, -component_pair_position)
+                    )
+                    print(f"PAIR UNWIND: Selling {component_pair_position} of {component} at {component_bid_price}")
+                    self.pair_positions[component] = 0
+                elif component_pair_position < 0:
+                    component_ask_price = min(state.order_depths[component].sell_orders.keys())
+                    self.component_orders[component].append(
+                        Order(component, component_ask_price, -component_pair_position)
+                    )
+                    print(f"PAIR UNWIND: Buying {-component_pair_position} of {component} at {component_ask_price}")
+                    self.pair_positions[component] = 0
+        
+        # Execute pair trades when z-score is extreme
+        if abs(zscore) >= 1.2:
+            # Calculate available capacity for pair trading for basket
+            basket_long_capacity, basket_short_capacity = self.calculate_available_capacity(
+                state, self.symbol, informed_only=False
+            )
+            
+            # Calculate available capacities for components
+            component_capacities = {}
+            for component in self.components:
+                long_capacity, short_capacity = self.calculate_available_capacity(
+                    state, component, informed_only=False
+                )
+                component_capacities[component] = (long_capacity, short_capacity)
+            
+            if zscore > 0:
+                # Basket is overpriced compared to components - SELL basket, BUY components
+                
+                # Max basket trade is limited by basket's short capacity
+                max_basket_trade = basket_short_capacity
+                
+                # Check component capacities
+                for component, quantity in self.components.items():
+                    hedge_qty = quantity * hedge_ratio
+                    component_long_capacity = component_capacities[component][0]
+                    max_from_component = component_long_capacity / hedge_qty if hedge_qty > 0 else float('inf')
+                    max_basket_trade = min(max_basket_trade, max_from_component)
+                
+                # Limit trade size to half of available capacity
+                max_basket_trade = int(max_basket_trade * 0.5)
+                
+                if max_basket_trade <= 0:
+                    return
+                
+                # Execute basket sell order
+                basket_best_bid = max(state.order_depths[self.symbol].buy_orders.keys())
+                basket_volume = state.order_depths[self.symbol].buy_orders[basket_best_bid]
+                actual_basket_trade = min(max_basket_trade, basket_volume)
+                
+                if actual_basket_trade <= 0:
+                    return
+                
+                self.sell(basket_best_bid, actual_basket_trade)
+                
+                # Track pair position
+                self.pair_positions[self.symbol] -= actual_basket_trade
+                
+                print(f"PAIR TRADE: Selling {actual_basket_trade} of basket at {basket_best_bid}")
+                
+                # Calculate component quantities
+                component_quantities = {}
+                
+                # Buy components with standard quantities
+                for component, quantity in self.components.items():
+                    component_ask_price = min(state.order_depths[component].sell_orders.keys())
+                    hedge_qty = quantity * hedge_ratio * actual_basket_trade
+                    
+                    if hedge_qty <= 0:
+                        continue
+                    
+                    # Available volume
+                    available_volume = abs(state.order_depths[component].sell_orders[component_ask_price])
+                    adjusted_qty = min(int(hedge_qty), available_volume)
+                    
+                    if adjusted_qty <= 0:
+                        continue
+                    
+                    # Add component order
+                    self.component_orders[component].append(
+                        Order(component, component_ask_price, adjusted_qty)
+                    )
+                    
+                    # Track component quantity for pair position
+                    component_quantities[component] = adjusted_qty
+                    
+                    print(f"PAIR TRADE: Buying {adjusted_qty} of {component} at {component_ask_price}")
+                
+                # Update pair positions with actual trades
+                self.update_pair_positions(-actual_basket_trade, component_quantities)
+                
+            else:
+                # Basket is underpriced compared to components - BUY basket, SELL components
+                
+                # Max basket trade is limited by basket's long capacity
+                max_basket_trade = basket_long_capacity
+                
+                # Check component capacities
+                for component, quantity in self.components.items():
+                    hedge_qty = quantity * hedge_ratio
+                    component_short_capacity = component_capacities[component][1]
+                    max_from_component = component_short_capacity / hedge_qty if hedge_qty > 0 else float('inf')
+                    max_basket_trade = min(max_basket_trade, max_from_component)
+                
+                # Limit trade size to half of available capacity
+                max_basket_trade = int(max_basket_trade * 0.5)
+                
+                if max_basket_trade <= 0:
+                    return
+                
+                # Execute basket buy order
+                basket_best_ask = min(state.order_depths[self.symbol].sell_orders.keys())
+                basket_volume = abs(state.order_depths[self.symbol].sell_orders[basket_best_ask])
+                actual_basket_trade = min(max_basket_trade, basket_volume)
+                
+                if actual_basket_trade <= 0:
+                    return
+                
+                self.buy(basket_best_ask, actual_basket_trade)
+                
+                # Track pair position
+                self.pair_positions[self.symbol] += actual_basket_trade
+                
+                print(f"PAIR TRADE: Buying {actual_basket_trade} of basket at {basket_best_ask}")
+                
+                # Calculate component quantities
+                component_quantities = {}
+                
+                # Sell components with standard quantities
+                for component, quantity in self.components.items():
+                    component_bid_price = max(state.order_depths[component].buy_orders.keys())
+                    hedge_qty = quantity * hedge_ratio * actual_basket_trade
+                    
+                    if hedge_qty <= 0:
+                        continue
+                    
+                    # Available volume
+                    available_volume = state.order_depths[component].buy_orders[component_bid_price]
+                    adjusted_qty = min(int(hedge_qty), available_volume)
+                    
+                    if adjusted_qty <= 0:
+                        continue
+                    
+                    # Add component order
+                    self.component_orders[component].append(
+                        Order(component, component_bid_price, -adjusted_qty)
+                    )
+                    
+                    # Track component quantity for pair position
+                    component_quantities[component] = -adjusted_qty
+                    
+                    print(f"PAIR TRADE: Selling {adjusted_qty} of {component} at {component_bid_price}")
+                
+                # Update pair positions with actual trades
+                self.update_pair_positions(actual_basket_trade, component_quantities)
+
+    def save(self):
+        """Save strategy state for next round"""
+        data = {
+            'basket_price_history': self.basket_price_history,
+            'component_price_history': self.component_price_history,
+            'price_history': self.price_history,
+            'informed_positions': self.informed_positions,
+            'pair_positions': self.pair_positions
+        }
+        return data
+
+    def load(self, data):
+        """Load strategy state from previous round"""
+        if data is None:
+            return
+        if isinstance(data, dict):
+            self.basket_price_history = data.get('basket_price_history', [])
+            self.component_price_history = data.get('component_price_history', [])
+            self.price_history = data.get('price_history', {self.symbol: [], **{comp: [] for comp in self.components}})
+            self.informed_positions = data.get('informed_positions', {comp: 0 for comp in self.components})
+            self.pair_positions = data.get('pair_positions', {self.symbol: 0, **{comp: 0 for comp in self.components}})
+            
+class BlackScholes:
+
+    # @staticmethod
+    # def erf_vec(x):
+    #     return np.vectorize(erf)(x)
+
+    @staticmethod
+    def normal_cdf(x):
+        # return 0.5 * (1 + BlackScholes.erf_vec(x / np.sqrt(2)))
+        return NormalDist().cdf(x)
+    
+    @staticmethod
+    def normal_pdf(x):
+        return np.exp(-0.5 * x * x) / np.sqrt(2 * np.pi)
+
+    @staticmethod
+    def d1(spot, strike, time_to_expiry, volatility):
+        return (
+            np.log(spot / strike)
+            + (0.5 * volatility * volatility) * time_to_expiry
+        ) / (volatility * np.sqrt(time_to_expiry))
+    
+    @staticmethod
+    def d2(spot, strike, time_to_expiry, volatility):
+        return BlackScholes.d1(spot, strike, time_to_expiry, volatility) - (
+            volatility * np.sqrt(time_to_expiry)
+        )
+
+    @staticmethod
+    def black_scholes_call(spot, strike, time_to_expiry, volatility):
+        d1 = BlackScholes.d1(spot, strike, time_to_expiry, volatility)
+        d2 = BlackScholes.d2(spot, strike, time_to_expiry, volatility)
+        call_price = spot*BlackScholes.normal_cdf(d1) - strike*BlackScholes.normal_cdf(d2)
+        return call_price
+
+    @staticmethod
+    def black_scholes_put(spot, strike, time_to_expiry, volatility):
+        d1 = BlackScholes.d1(spot, strike, time_to_expiry, volatility)
+        d2 = BlackScholes.d2(spot, strike, time_to_expiry, volatility)
+        put_price = strike*BlackScholes.normal_cdf(-d2) - spot*BlackScholes.normal_cdf(-d1)
+        return put_price
+
+    @staticmethod
+    def delta(spot, strike, time_to_expiry, volatility):
+        d1 = BlackScholes.d1(spot, strike, time_to_expiry, volatility)
+        return BlackScholes.normal_cdf(d1)
+
+    @staticmethod
+    def gamma(spot, strike, time_to_expiry, volatility):
+        d1 = BlackScholes.d1(spot, strike, time_to_expiry, volatility)
+        return BlackScholes.normal_pdf(d1) / (spot * volatility * np.sqrt(time_to_expiry))
+
+    @staticmethod
+    def vega(spot, strike, time_to_expiry, volatility):
+        d1 = BlackScholes.d1(spot, strike, time_to_expiry, volatility)
+        # print(f"d1: {d1}")
+        # print(f"vol: {volatility}")
+        # print(f"spot: {spot}")
+        # print(f"strike: {strike}")
+        # print(f"time: {time_to_expiry}")
+        return BlackScholes.normal_pdf(d1) * (spot * np.sqrt(time_to_expiry)) / 100
+
+    @staticmethod
+    def implied_volatility(
+        call_price, spot, strike, time_to_expiry, max_iterations=200, tolerance=1e-10
+    ):
+        low_vol = 0.01
+        high_vol = 1.0
+        volatility = (low_vol + high_vol) / 2.0  # Initial guess as the midpoint
+        for _ in range(max_iterations):
+            estimated_price = BlackScholes.black_scholes_call(
+                spot, strike, time_to_expiry, volatility
+            )
+            diff = estimated_price - call_price
+            if abs(diff) < tolerance:
+                break
+            elif diff > 0:
+                high_vol = volatility
+            else:
+                low_vol = volatility
+            volatility = (low_vol + high_vol) / 2.0
+        return volatility if not np.isnan(volatility) else 0.15
+
+
+class VolcanicVolatilityStrategy(Strategy):
+    def __init__(self, symbol: str, limit: int) -> None:
+        super().__init__(symbol, limit)
+        
+        # Store price history for realized volatility calculation
+        self.price_history = []
+        self.max_history_size = 15  # Balance between accuracy and performance
+        
+        # Risk-free rate (assumed 0 in this environment)
+        self.risk_free_rate = 0
+        
+        # Voucher (option) symbols and their strike prices
+        self.vouchers = {
+            Product.VOLCANIC_ROCK_VOUCHER_9500: 9500,
+            Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
+            Product.VOLCANIC_ROCK_VOUCHER_10000: 10000,
+            Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
+            Product.VOLCANIC_ROCK_VOUCHER_10500: 10500
+        }
+        
+        # Position limits for each product
+        self.position_limits = {
+            Product.VOLCANIC_ROCK: min(limit, 200),  # Increased limit for underlying
+            Product.VOLCANIC_ROCK_VOUCHER_9500: 40,  # Increased option limits
+            Product.VOLCANIC_ROCK_VOUCHER_9750: 40,
+            Product.VOLCANIC_ROCK_VOUCHER_10000: 40,
+            Product.VOLCANIC_ROCK_VOUCHER_10250: 40,
+            Product.VOLCANIC_ROCK_VOUCHER_10500: 40
+        }
+        
+        # Strategy parameters
+        self.pair_trade_size = 40  # Size for each pair trade
+        self.vol_diff_threshold = 0.03  # 3% difference to trigger trade
+        
+        # Tracking orders for all products
+        self.all_orders = {}
+        
+        # Track Pablo's recent trades for the underlying and 9500 voucher
+        self.pablo_recent_trades = {
+            self.symbol: [],
+            Product.VOLCANIC_ROCK_VOUCHER_9500: []
+        }
+        
+        # Name of trader we're following
+        self.trader_to_follow = "Pablo"
+
+        # Original volatility parameters - exactly as in original code
+        self.IV_polyfit_coeffs = {
+            10000: (0.41254319141656226, 0.06312435975125744, 0.1345909178256186),
+            10250: (0.5860105985216032, -0.014340196546607894, 0.1151539202223983),
+            10500: (0.5139630548602544, -0.0949178856076133, 0.137343807537834),
+            9500: (0.6472303463939466, 0.7061540800206693, 0.336985072679986),
+            9750: (0.10501691552121206, 0.008020755800816895, 0.1435452382599635)
+        }
+        
+        # Trading regions - exactly as in original code
+        self.m_trading_region = {
+            # 9500: (-0.7, -0.4),
+            9500: (0, 0),
+            9750: (-0.5, -0.05),
+            10000: (-0.4, 0.2),
+            10250: (0, 0),
+            10500: (0, 0),
+        }
+        
+        # IV thresholds - exactly as in original code
+        self.IV_std = {
+            10000: 0.009599370734407729,
+            10250: 0.0036387497463808262,
+            10500: 0.005020972277118111,
+            9500: 0.04160594365908716,
+            9750: 0.01292240662184325
+        }
+        
+        self.tau = 3 / 252  # from rd1 expiry = 7 days
+    
+    def run(self, state: TradingState) -> tuple[dict[str, list[Order]], int]:
+        """
+        Override the run method to handle multiple products
+        Returns orders for all products and conversions (always 0 for volcanic products)
+        """
+        # Initialize orders dictionary for all products
+        self.all_orders = {product: [] for product in [self.symbol] + list(self.vouchers.keys())}
+        self.orders = []  # Will be used for the main symbol
+        
+        # Execute trading strategy
+        self.act(state)
+        
+        # Collect all orders for the main product
+        if self.orders:
+            self.all_orders[self.symbol] = self.orders
+        
+        # Flatten the orders dictionary into the expected format
+        result_orders = {}
+        for product, order_list in self.all_orders.items():
+            if order_list:
+                result_orders[product] = order_list
+        
+        return result_orders, 0  # No conversions for volcanic products
+    
+    def get_mid_price(self, state: TradingState, symbol: str) -> float:
+        """Calculate mid price from order book"""
+        if symbol not in state.order_depths:
+            return None
+            
+        order_depth = state.order_depths[symbol]
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return None
+            
+        best_bid = max(order_depth.buy_orders.keys())
+        best_ask = min(order_depth.sell_orders.keys())
+
+        return (best_bid + best_ask) / 2
+
+    def act(self, state: TradingState) -> None:
+        """Main strategy execution - hybrid approach"""
+        # Check if underlying is in the market
+        if self.symbol not in state.order_depths:
+            return
+
+        order_depth = state.order_depths[self.symbol]
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return
+
+        # Get current price of the underlying
+        rock_price = self.get_mid_price(state, self.symbol)
+        if rock_price is None:
+            return
+
+        # Add to price history for volatility calculation
+        self.price_history.append(rock_price)
+        if len(self.price_history) > self.max_history_size:
+            self.price_history = self.price_history[-self.max_history_size:]
+            
+        # Follow Pablo for VOLCANIC_ROCK (underlying)
+        self._follow_pablo(state, self.symbol)
+        
+        # Follow Pablo for VOLCANIC_ROCK_VOUCHER_9500
+        self._follow_pablo(state, Product.VOLCANIC_ROCK_VOUCHER_9500)
+        self._follow_pablo(state, Product.VOLCANIC_ROCK_VOUCHER_10250)
+
+        
+        # Use original volatility approach for other vouchers
+        time_to_expiry = self.tau
+        net_delta = self._calculate_net_delta(state, rock_price, time_to_expiry)
+        
+        # Don't include rock_price in net_delta calculation for trading
+        self._trade_volatility_arbitrage(state, rock_price, net_delta)
+
+    def _follow_pablo(self, state: TradingState, symbol: str) -> None:
+        """Follow Pablo's trades for a specific symbol"""
+        # Skip if symbol isn't in market or order depth
+        if (symbol not in state.market_trades or
+            symbol not in state.order_depths):
+            return
+            
+        # Update Pablo's recent trades for this symbol
+        trades = state.market_trades[symbol]
+        pablo_trades = [
+            trade for trade in trades
+            if trade.buyer == self.trader_to_follow or trade.seller == self.trader_to_follow
+        ]
+        
+        if pablo_trades:
+            if symbol not in self.pablo_recent_trades:
+                self.pablo_recent_trades[symbol] = []
+                
+            self.pablo_recent_trades[symbol].extend(pablo_trades)
+            self.pablo_recent_trades[symbol] = self.pablo_recent_trades[symbol][-100:]  # Keep only the most recent 100
+            
+        # Skip if no recent trades from Pablo for this symbol
+        if symbol not in self.pablo_recent_trades or not self.pablo_recent_trades[symbol]:
+            return
+            
+        # Calculate Pablo's net position
+        pablo_buys = sum(
+            trade.quantity 
+            for trade in self.pablo_recent_trades[symbol]
+            if trade.buyer == self.trader_to_follow
+        )
+        
+        pablo_sells = sum(
+            trade.quantity 
+            for trade in self.pablo_recent_trades[symbol]
+            if trade.seller == self.trader_to_follow
+        )
+        
+        pablo_net = pablo_buys - pablo_sells
+        
+        # Skip if Pablo has no net position
+        if pablo_net == 0:
+            return
+            
+        # Get current position and capacity
+        current_position = state.position.get(symbol, 0)
+        
+        if pablo_net > 0:
+            # Pablo is net long - we should buy
+            buy_capacity = self.position_limits[symbol] - current_position
+            
+            # Skip if no capacity
+            if buy_capacity <= 0:
+                return
+                
+            # Get order depth
+            order_depth = state.order_depths[symbol]
+            if not order_depth.sell_orders:
+                return
+                
+            best_ask = min(order_depth.sell_orders.keys())
+            available_volume = abs(order_depth.sell_orders[best_ask])
+            
+            # Calculate trade size (min of Pablo's position, our capacity, available volume)
+            trade_size = min(abs(pablo_net), buy_capacity, available_volume)
+            
+            if trade_size > 0:
+                if symbol == self.symbol:
+                    self.buy(best_ask, trade_size)
+                else:
+                    self._add_order(symbol, best_ask, trade_size)
+                
+        else:  # pablo_net < 0
+            # Pablo is net short - we should sell
+            sell_capacity = self.position_limits[symbol] + current_position
+            
+            # Skip if no capacity
+            if sell_capacity <= 0:
+                return
+                
+            # Get order depth
+            order_depth = state.order_depths[symbol]
+            if not order_depth.buy_orders:
+                return
+                
+            best_bid = max(order_depth.buy_orders.keys())
+            available_volume = order_depth.buy_orders[best_bid]
+            
+            # Calculate trade size (min of Pablo's position, our capacity, available volume)
+            trade_size = min(abs(pablo_net), sell_capacity, available_volume)
+            
+            if trade_size > 0:
+                if symbol == self.symbol:
+                    self.sell(best_bid, trade_size)
+                else:
+                    self._add_order(symbol, best_bid, -trade_size)
+
+    def _calculate_net_delta(self, state, rock_price, time_to_expiry):
+        """Calculate net delta exposure from options without hedging"""
+        # Calculate total delta exposure from all options
+        net_delta = 0
+
+        for voucher_symbol, strike_price in self.vouchers.items():
+            # Skip the 9500 voucher (already handled by Pablo-following)
+            if voucher_symbol == Product.VOLCANIC_ROCK_VOUCHER_9500:
+                continue
+                
+            # Get current position
+            position = state.position.get(voucher_symbol, 0)
+
+            # Skip if no position
+            if position == 0:
+                continue
+
+            # Calculate option delta
+            option_price = self.get_mid_price(state, voucher_symbol)
+            if option_price is None:
+                continue
+                
+            IV = self._get_IV(option_price, rock_price, strike_price)
+            option_delta = self._calculate_option_delta(
+                rock_price, strike_price, time_to_expiry, self.risk_free_rate, IV
+            )
+
+            # Add to net delta exposure
+            net_delta += position * option_delta
+
+        # Intentionally skip adding the underlying position (rock) to delta - we don't want to hedge it
+
+        return net_delta
+
+    def _trade_volatility_arbitrage(self, state, rock_price, current_net_delta):
+        """Trade other vouchers using original volatility-based approach"""
+        options_traded = 0
+        new_delta = 0
+        
+        for voucher_symbol, strike_price in self.vouchers.items():
+            # Skip the 9500 voucher (already handled by Pablo-following)
+            if voucher_symbol == Product.VOLCANIC_ROCK_VOUCHER_9500:
+                continue
+                
+            # Check if this option is in the order book
+            if voucher_symbol not in state.order_depths:
+                continue
+
+            order_depth = state.order_depths[voucher_symbol]
+            if not order_depth.buy_orders or not order_depth.sell_orders:
+                continue
+
+            # Get current market price
+            option_price = self.get_mid_price(state, voucher_symbol)
+            if option_price is None:
+                continue
+
+            # Get current position
+            current_position = state.position.get(voucher_symbol, 0)
+
+            # Calculate position limit remaining
+            position_limit = self.position_limits.get(voucher_symbol, 40)
+            buy_capacity = position_limit - current_position
+            sell_capacity = position_limit + current_position
+
+            # Skip if we're at position limits
+            if buy_capacity <= 0 and sell_capacity <= 0:
+                continue
+
+            IV = self._get_IV(option_price, rock_price, strike_price)
+            if IV is None:
+                continue
+                
+            option_delta = self._calculate_option_delta(
+                rock_price, strike_price, self.tau, self.risk_free_rate, IV
+            )
+            
+            # Check moneyness
+            moneyness = np.log(strike_price / rock_price) / np.sqrt(self.tau)
+            if moneyness < self.m_trading_region[strike_price][0] or moneyness > self.m_trading_region[strike_price][1]:
+                # clear option position if outside trading region
+                if current_position > 0:
+                    # Sell option
+                    price = max(order_depth.buy_orders.keys())
+                    self._add_order(voucher_symbol, price, -sell_capacity)
+                    new_delta -= option_delta * sell_capacity
+                if current_position < 0:
+                    # Buy option
+                    price = min(order_depth.sell_orders.keys())
+                    self._add_order(voucher_symbol, price, buy_capacity)
+                    new_delta += option_delta * buy_capacity
+                continue
+                
+            IV_pred = self._get_fair_IV(rock_price, strike_price)
+            vol_diff = IV - IV_pred
+            
+            if abs(vol_diff) > self.IV_std[strike_price]:
+                # check underlying position limit
+                if vol_diff > 0:
+                    # Sell option
+                    price = max(order_depth.buy_orders.keys())
+                    self._add_order(voucher_symbol, price, -sell_capacity)
+                    options_traded += 1
+                else:
+                    # Buy option
+                    price = min(order_depth.sell_orders.keys())
+                    self._add_order(voucher_symbol, price, buy_capacity)
+                    options_traded += 1
+            elif abs(vol_diff) < self.IV_std[strike_price]*0.5:
+                # close option position
+                if current_position > 0:
+                    # Sell option
+                    price = max(order_depth.buy_orders.keys())
+                    self._add_order(voucher_symbol, price, -sell_capacity)
+                if current_position < 0:
+                    # Buy option
+                    price = min(order_depth.sell_orders.keys())
+                    self._add_order(voucher_symbol, price, buy_capacity)
+
+        # No delta hedging of the underlying at all - we don't want to trade the rock based on options
+
+    def _get_fair_IV(self, rock_price, strike_price):
+        """Calculate fair IV - identical to original code"""
+        moneyness = np.log(strike_price / rock_price) / np.sqrt(self.tau)
+        a, b, c = self.IV_polyfit_coeffs[strike_price]
+        IV_pred = a * moneyness**2 + b * moneyness + c
+        return IV_pred
+
+    def _get_IV(self, option_price, spot, strike_price):
+        """Calculate IV - identical to original code"""
+        try:
+            IV = BlackScholes.implied_volatility(
+                option_price, spot, strike_price, self.tau, tolerance=1e-6
+            )
+            return IV
+        except:
+            return 0.15  # Default IV
+
+    def _add_order(self, symbol, price, quantity):
+        """Add an order for a specific product"""
+        if symbol not in self.all_orders:
+            self.all_orders[symbol] = []
+
+        self.all_orders[symbol].append(Order(symbol, price, quantity))
+
+    def _calculate_option_delta(self, S, K, T, r, sigma):
+        """Calculate option delta"""
+        d1 = (math.log(S/K) + (r + sigma**2/2)*T) / (sigma*math.sqrt(T))
+        return NormalDist().cdf(d1)
+
+    def save(self):
+        """Save strategy state for next round"""
+        return {
+            'price_history': self.price_history,
+            'pablo_recent_trades': self.pablo_recent_trades
+        }
+
+    def load(self, data):
+        """Load strategy state from previous round"""
+        if data is None:
+            return
+
+        if isinstance(data, dict):
+            if 'price_history' in data:
+                self.price_history = data['price_history']
+            if 'pablo_recent_trades' in data:
+                self.pablo_recent_trades = data['pablo_recent_trades']
+                                    
+                                                                                                
+class MacaronsStrategy(Strategy):
+    """
+    Simplified strategy for MAGNIFICENT_MACARONS:
+    1. Buys everything when sunlight index < 45
+    2. Sells everything when sunlight index starts increasing
+    3. Executes arbitrage in other situations
+    """
+    def __init__(self, symbol: str, limit: int) -> None:
+        super().__init__(symbol, limit)
+        # Strategy parameters
+        self.conversion_limit = 10
+        self.conversions = 0
+        self.critical_sunlight_index = 45
+        
+        # Track sunlight history for trend detection
+        self.sunlight_history = []
+    
+    def act(self, state: TradingState) -> None:
+        """Simplified strategy execution based solely on sunlight index"""
+        # Reset conversions
+        self.conversions = 0
+        
+        # Quick validity checks
+        if (self.symbol not in state.order_depths or 
+            self.symbol not in state.observations.conversionObservations):
+            return
+            
+        # Get order book data
+        order_depth = state.order_depths[self.symbol]
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return
+            
+        # Get conversion data
+        conv_obs = state.observations.conversionObservations[self.symbol]
+        
+        # Get current sunlight index and update history
+        current_sunlight = conv_obs.sunlightIndex
+        self.sunlight_history.append(current_sunlight)
+        
+        # Keep only the most recent sunlight readings
+        if len(self.sunlight_history) > 10:
+            self.sunlight_history = self.sunlight_history[-10:]
+        
+        # Get current position
+        position = state.position.get(self.symbol, 0)
+        
+        # ALWAYS try arbitrage first
+        if self._try_arbitrage(state, order_depth, position, conv_obs):
+            return
+        
+        # Check if sunlight index is below critical threshold
+        if current_sunlight < self.critical_sunlight_index:
+            # Only buy if we're not at position limit
+            if position < self.limit:
+                self._buy_all(state, order_depth, position, conv_obs)
+                return
+        
+        # Check if sunlight has started increasing (positive slope)
+        if len(self.sunlight_history) >= 2:
+            # Calculate slope from the last two readings
+            slope = self.sunlight_history[-1] - self.sunlight_history[-2]
+            
+            # If slope is positive and we have a position, SELL everything
+            if slope > 0 and position > 0:
+                self._sell_all(state, order_depth, position, conv_obs)
+                return
+
+    def _try_arbitrage(self, state, order_depth, position, conv_obs):
+        """Execute pure arbitrage and return True if executed"""
+        # Get market prices
+        market_best_bid = max(order_depth.buy_orders.keys())
+        market_best_ask = min(order_depth.sell_orders.keys())
+        
+        # Get conversion prices
+        conversion_buy_price = conv_obs.askPrice + conv_obs.transportFees + conv_obs.importTariff
+        conversion_sell_price = conv_obs.bidPrice - conv_obs.transportFees - conv_obs.exportTariff
+        
+        # Arbitrage 1: Buy from conversion, sell to market
+        if conversion_buy_price < market_best_bid:
+            # Calculate potential profit
+            profit_per_unit = market_best_bid - conversion_buy_price
+            # Account for storage costs
+            storage_cost = 0.1  # Storage cost per unit per timestamp
+            adjusted_profit = profit_per_unit - storage_cost
+            
+            if adjusted_profit > 0:
+                # Calculate trade size (default to conversion limit for pure arbitrage)
+                trade_size = min(self.conversion_limit, 
+                               sum(volume for price, volume in order_depth.buy_orders.items() 
+                                  if price >= market_best_bid))
+                
+                if trade_size > 0:
+                    self.conversions = trade_size  # Buy from conversion
+                    self.sell(market_best_bid, trade_size)  # Sell to market
+                    return True
+        
+        # Arbitrage 2: Buy from market, sell to conversion
+        elif market_best_ask < conversion_sell_price:
+            # Calculate potential profit
+            profit_per_unit = conversion_sell_price - market_best_ask
+            
+            if profit_per_unit > 0:
+                # Calculate trade size (default to conversion limit for pure arbitrage)
+                trade_size = min(self.conversion_limit, 
+                               sum(-volume for price, volume in order_depth.sell_orders.items() 
+                                  if price <= market_best_ask))
+                
+                if trade_size > 0:
+                    self.buy(market_best_ask, trade_size)  # Buy from market
+                    self.conversions = -trade_size  # Sell to conversion
+                    return True
+        
+        return False
+
+    def _buy_all(self, state, order_depth, position, conv_obs):
+        """Buy as much as possible using market and conversion"""
+        # Calculate how much we can buy
+        to_buy = self.limit - position
+        if to_buy <= 0:
+            return
+        
+        # Get market prices
+        market_best_ask = min(order_depth.sell_orders.keys())
+        
+        # Get conversion price
+        conversion_buy_price = conv_obs.askPrice + conv_obs.transportFees + conv_obs.importTariff
+        
+        # Track if any trades executed
+        trades_executed = False
+        
+        # First, buy from cheaper source
+        if market_best_ask <= conversion_buy_price:
+            # Buy from market first
+            market_liquidity = sum(-volume for price, volume in order_depth.sell_orders.items())
+            market_buy_qty = min(to_buy, market_liquidity)
+            
+            if market_buy_qty > 0:
+                self.buy(market_best_ask, market_buy_qty)
+                to_buy -= market_buy_qty
+                trades_executed = True
+        else:
+            # Market is more expensive, try conversion
+            conversion_buy_qty = min(to_buy, self.conversion_limit)
+            if conversion_buy_qty > 0:
+                self.conversions = conversion_buy_qty
+                to_buy -= conversion_buy_qty
+                trades_executed = True
+        
+        # If no trades executed, try buying from more expensive source
+        if not trades_executed:
+            if market_best_ask < float('inf'):  # If market has liquidity
+                market_buy_qty = min(to_buy, sum(-volume for price, volume in order_depth.sell_orders.items()))
+                if market_buy_qty > 0:
+                    self.buy(market_best_ask, market_buy_qty)
+            else:
+                # Try conversion as last resort
+                conversion_buy_qty = min(to_buy, self.conversion_limit)
+                if conversion_buy_qty > 0:
+                    self.conversions = conversion_buy_qty
+
+    def _sell_all(self, state, order_depth, position, conv_obs):
+        """Sell entire position using market and conversion"""
+        if position <= 0:
+            return
+        
+        # Get market prices
+        market_best_bid = max(order_depth.buy_orders.keys())
+        
+        # Get conversion price
+        conversion_sell_price = conv_obs.bidPrice - conv_obs.transportFees - conv_obs.exportTariff
+        
+        # Track if any trades executed
+        trades_executed = False
+        
+        # First, sell to the higher priced source
+        if market_best_bid >= conversion_sell_price:
+            # Sell to market first
+            market_liquidity = sum(volume for price, volume in order_depth.buy_orders.items())
+            market_sell_qty = min(position, market_liquidity)
+            
+            if market_sell_qty > 0:
+                self.sell(market_best_bid, market_sell_qty)
+                position -= market_sell_qty
+                trades_executed = True
+        else:
+            # Conversion offers better price
+            conversion_sell_qty = min(position, self.conversion_limit)
+            if conversion_sell_qty > 0:
+                self.conversions = -conversion_sell_qty
+                position -= conversion_sell_qty
+                trades_executed = True
+        
+        # If no trades executed, try selling to less favorable source
+        if not trades_executed:
+            if market_best_bid > 0:  # If market has liquidity
+                market_sell_qty = min(position, sum(volume for price, volume in order_depth.buy_orders.items()))
+                if market_sell_qty > 0:
+                    self.sell(market_best_bid, market_sell_qty)
+            else:
+                # Try conversion as last resort
+                conversion_sell_qty = min(position, self.conversion_limit)
+                if conversion_sell_qty > 0:
+                    self.conversions = -conversion_sell_qty
+    
+    def run(self, state: TradingState) -> tuple[list[Order], int]:
+        self.orders = []
+        self.conversions = 0
+        
+        self.act(state)
+        
+        return self.orders, self.conversions
+        
+    def save(self):
+        """Save strategy state for next iteration"""
+        return {
+            'sunlight_history': self.sunlight_history
+        }
+        
+    def load(self, data):
+        """Load strategy state from previous iteration"""
+        if not data:
+            return
+            
+        if 'sunlight_history' in data:
+            self.sunlight_history = data['sunlight_history']
+
+class Trader:
+    def __init__(self) -> None:
+        # Position limits for each product
+        self.limits = {
+            Product.RAINFOREST_RESIN: 50, 
+            Product.KELP: 50,
+            Product.SQUID_INK: 50,
+            Product.CROISSANT: 250,
+            Product.JAM: 350,
+            Product.DJEMBE: 60,
+            Product.PICNIC_BASKET1: 60,
+            Product.PICNIC_BASKET2: 100,
+            Product.VOLCANIC_ROCK: 400,
+            Product.VOLCANIC_ROCK_VOUCHER_9500: 200,
+            Product.VOLCANIC_ROCK_VOUCHER_9750: 200,
+            Product.VOLCANIC_ROCK_VOUCHER_10000: 200,
+            Product.VOLCANIC_ROCK_VOUCHER_10250: 200,
+            Product.VOLCANIC_ROCK_VOUCHER_10500: 200,
+            Product.MAGNIFICENT_MACARONS: 75
+        }
+
+        # Create strategies for each product
+        self.strategies = {
+            Product.RAINFOREST_RESIN: RainforestResinStrategy(Product.RAINFOREST_RESIN, self.limits[Product.RAINFOREST_RESIN]),
+            Product.KELP: KelpStrategy(Product.KELP, self.limits[Product.KELP]),
+            Product.SQUID_INK: SquidInkStrategy(Product.SQUID_INK, self.limits[Product.SQUID_INK]),
+            # Product.PICNIC_BASKET1: PicnicBasketStrategy(Product.PICNIC_BASKET1, self.limits[Product.PICNIC_BASKET1]),
+            # Product.PICNIC_BASKET2: PicnicBasketStrategy(Product.PICNIC_BASKET2, self.limits[Product.PICNIC_BASKET2]),
+            Product.PICNIC_BASKET1: ETFArbitrageStrategy(Product.PICNIC_BASKET1, self.limits[Product.PICNIC_BASKET1]),
+            Product.PICNIC_BASKET2: ETFArbitrageStrategy(Product.PICNIC_BASKET2, self.limits[Product.PICNIC_BASKET2]),
+            Product.MAGNIFICENT_MACARONS: MacaronsStrategy(Product.MAGNIFICENT_MACARONS, self.limits[Product.MAGNIFICENT_MACARONS])
+        }
+        
+        # Create unified volcanic strategy to handle VOLCANIC_ROCK and all vouchers
+        self.volcanic_strategy = VolcanicVolatilityStrategy(
+            Product.VOLCANIC_ROCK,
+            self.limits[Product.VOLCANIC_ROCK]
+        )
+        
+        # Initialize logger
+        self.logger = Logger()
+        
+        # Initialize regression hedging strategy
+        self.hedging_strategy = RegressionHedgingStrategy()
+    
+    def _hedge_basket_with_components(
+        self, state: TradingState, basket: str, is_long: bool, hedge_orders: Dict[str, List[Order]]
+    ) -> None:
+        """
+        Hedge a high basket position using its components.
+        If long basket, sell components; if short basket, buy components.
+        """
+        position = state.position.get(basket, 0)
+        
+        # Calculate trade size as a portion of the position to reduce (but not eliminate)
+        hedge_size = min(abs(position) // 3, self.max_hedge_trade_size)
+        hedge_size = max(hedge_size, self.min_hedge_trade_size)
+        
+        if hedge_size == 0:
+            return
+            
+        # Get components for this basket
+        components = self.hedge_coefficients[basket].keys()
+        
+        # Check if we can actually hedge with components
+        for component in components:
+            # Skip if component not in market
+            if component not in state.order_depths:
+                return
+                
+            # Check if order book has necessary liquidity
+            order_depth = state.order_depths[component]
+            if (is_long and not order_depth.sell_orders) or (not is_long and not order_depth.buy_orders):
+                return
+        
+        # Create hedge orders
+        for component in components:
+            # Get coefficient (or use default composition if regression not ready)
+            coefficient = self.hedge_coefficients[basket][component]
+            if coefficient is None:
+                coefficient = self.default_compositions[basket][component]
+            
+            # Calculate component quantity based on hedge size and coefficient
+            component_qty = round(hedge_size * coefficient)
+            
+            # Skip if quantity is zero
+            if component_qty == 0:
+                continue
+                
+            # Determine price
+            order_depth = state.order_depths[component]
+            if is_long:  # If long basket, we sell components
+                price = max(order_depth.buy_orders.keys())  # Sell at best bid
+                # Make the order opposite to basket position
+                qty = -component_qty
+            else:  # If short basket, we buy components
+                price = min(order_depth.sell_orders.keys())  # Buy at best ask
+                # Make the order opposite to basket position
+                qty = component_qty
+            
+            # Add order
+            if component not in hedge_orders:
+                hedge_orders[component] = []
+            
+            hedge_orders[component].append(Order(component, price, qty))
+        
+        # Also reduce the basket position
+        if basket in state.order_depths:
+            order_depth = state.order_depths[basket]
+            
+            if is_long and order_depth.buy_orders:  # If long basket, sell some
+                price = max(order_depth.buy_orders.keys())  # Sell at best bid
+                
+                if basket not in hedge_orders:
+                    hedge_orders[basket] = []
+                    
+                hedge_orders[basket].append(Order(basket, price, -hedge_size))
+                
+            elif not is_long and order_depth.sell_orders:  # If short basket, buy some
+                price = min(order_depth.sell_orders.keys())  # Buy at best ask
+                
+                if basket not in hedge_orders:
+                    hedge_orders[basket] = []
+                    
+                hedge_orders[basket].append(Order(basket, price, hedge_size))
+    
+    def _hedge_component_with_baskets(
+        self, state: TradingState, component: str, is_long: bool, hedge_orders: Dict[str, List[Order]]
+    ) -> None:
+        """
+        Hedge a high component position using baskets that contain it.
+        If long component, buy baskets and sell other components; 
+        if short component, sell baskets and buy other components.
+        """
+        position = state.position.get(component, 0)
+        
+        # Calculate which baskets contain this component
+        containing_baskets = []
+        for basket, components in self.default_compositions.items():
+            if component in components:
+                containing_baskets.append(basket)
+        
+        if not containing_baskets:
+            return
+            
+        # Calculate hedge size
+        hedge_size = min(abs(position) // 5, self.max_hedge_trade_size)
+        hedge_size = max(hedge_size, self.min_hedge_trade_size)
+        
+        if hedge_size == 0:
+            return
+        
+        # Try to hedge with each basket
+        for basket in containing_baskets:
+            # Skip if basket not in market
+            if basket not in state.order_depths:
+                continue
+                
+            # Check if order book has necessary liquidity
+            order_depth = state.order_depths[basket]
+            if (not is_long and not order_depth.sell_orders) or (is_long and not order_depth.buy_orders):
+                continue
+            
+            # Get coefficient (or use default composition if regression not ready)
+            coefficient = self.hedge_coefficients.get(basket, {}).get(component)
+            if coefficient is None:
+                coefficient = self.default_compositions[basket][component]
+            
+            # Calculate basket quantity based on hedge size and coefficient
+            # We divide by coefficient because we're going in the opposite direction
+            basket_qty = round(hedge_size / coefficient) if coefficient != 0 else 0
+            
+            # Skip if quantity is zero
+            if basket_qty == 0:
+                continue
+                
+            # Determine price for basket
+            if is_long:  # If long component, we buy baskets
+                price = min(order_depth.sell_orders.keys())  # Buy at best ask
+                # Add order for basket
+                if basket not in hedge_orders:
+                    hedge_orders[basket] = []
+                
+                hedge_orders[basket].append(Order(basket, price, basket_qty))
+                
+            else:  # If short component, we sell baskets
+                price = max(order_depth.buy_orders.keys())  # Sell at best bid
+                # Add order for basket
+                if basket not in hedge_orders:
+                    hedge_orders[basket] = []
+                
+                hedge_orders[basket].append(Order(basket, price, -basket_qty))
+            
+            # Now we need to hedge the other components in the basket
+            for other_component, other_coef in self.default_compositions[basket].items():
+                if other_component == component:
+                    continue  # Skip the component we're hedging
+                
+                if other_component not in state.order_depths:
+                    continue
+                
+                order_depth = state.order_depths[other_component]
+                
+                # When buying baskets (long component), we sell other components
+                # When selling baskets (short component), we buy other components
+                other_qty = basket_qty * other_coef
+                
+                if other_qty == 0:
+                    continue
+                
+                if is_long:  # If long our component, sell other components
+                    if not order_depth.buy_orders:
+                        continue
+                    price = max(order_depth.buy_orders.keys())  # Sell at best bid
+                    qty = -other_qty
+                else:  # If short our component, buy other components
+                    if not order_depth.sell_orders:
+                        continue
+                    price = min(order_depth.sell_orders.keys())  # Buy at best ask
+                    qty = other_qty
+                
+                # Add order for other component
+                if other_component not in hedge_orders:
+                    hedge_orders[other_component] = []
+                
+                hedge_orders[other_component].append(Order(other_component, price, qty))
+    
+    def execute_hedge(self, state: TradingState) -> Dict[str, List[Order]]:
+        """
+        Main method to execute regression-based hedging strategy.
+        """
+        # Update price history with latest market data
+        self.update_price_history(state)
+        
+        # Update regression coefficients
+        self.update_hedge_coefficients()
+        
+        # Identify products with high positions
+        high_position_products = self.identify_high_positions(state)
+        
+        # If no high positions, return empty orders
+        if not high_position_products:
+            return {}
+        
+        # Calculate hedge trades for high position products
+        hedge_orders = self.calculate_hedge_trades(state, high_position_products)
+        
+        return hedge_orders
+        
+    def run(self, state: TradingState) -> tuple[dict[str, list[Order]], int, str]:
+        """Main trading logic with fixed basket handling"""
+        orders = {}
+        conversions = 0
+        handled_products = set()
+    
+        # Load trader data from previous states
+        old_trader_data = {}
+        if state.traderData and state.traderData != "":
+            try:
+                old_trader_data = jsonpickle.decode(state.traderData)
+            except:
+                old_trader_data = {}
+        
+        new_trader_data = {}
+    
+        # First handle the basket arbitrage strategies
+        print("Handling basket strategies...")
+        for basket in [Product.PICNIC_BASKET1, Product.PICNIC_BASKET2]:
+            # Skip if basket isn't in order depths
+            if basket not in state.order_depths:
+                continue
+            # Load previous state if available
+            if basket in old_trader_data:
+                self.strategies[basket].load(old_trader_data[basket])
+            # Run the basket strategy
+            strategy = self.strategies[basket]
+            basket_orders, _ = strategy.run(state)
+            component_orders = getattr(strategy, 'component_orders', {})
+            
+            # Only process if BOTH basket orders AND component orders exist
+            if basket_orders and any(orders for component, orders in component_orders.items()):
+                # Add basket orders (without reversal)
+                orders[basket] = basket_orders
+                
+                # Mark basket as handled
+                handled_products.add(basket)
+                
+                # Add component orders
+                for component, comp_orders in component_orders.items():
+                    if comp_orders:
+                        if component not in orders:
+                            orders[component] = []
+                        orders[component].extend(comp_orders)
+                        handled_products.add(component)
+            
+            # Save strategy state
+            new_trader_data[basket] = strategy.save()
+        
+        # Process remaining products with standard strategies
+        print("Handling standard strategies...")
+        for product, strategy in self.strategies.items():
+            # Skip products already handled
+            if product in handled_products:
+                continue
+                
+            # Skip products not in order depths
+            if product not in state.order_depths:
+                continue
+                
+            # Load previous state if available
+            if product in old_trader_data:
+                strategy.load(old_trader_data[product])
+            
+            # Run the strategy
+            product_orders, product_conversions = strategy.run(state)
+            
+            # Add orders and conversions
+            if product_orders:
+                orders[product] = product_orders
+            conversions += product_conversions
+            
+            # Save strategy state
+            new_trader_data[product] = strategy.save()
+
+        # Handle volcanic products with the unified strategy
+        print("Handling volcanic products...")
+        volcanic_products = [
+            Product.VOLCANIC_ROCK,
+            Product.VOLCANIC_ROCK_VOUCHER_9500,
+            Product.VOLCANIC_ROCK_VOUCHER_9750,
+            Product.VOLCANIC_ROCK_VOUCHER_10000,
+            Product.VOLCANIC_ROCK_VOUCHER_10250,
+            Product.VOLCANIC_ROCK_VOUCHER_10500
+        ]
+        
+        # Check if any volcanic product is in order depths
+        if any(product in state.order_depths for product in volcanic_products):
+            # Load previous state if available
+            if 'volcanic_strategy' in old_trader_data:
+                self.volcanic_strategy.load(old_trader_data['volcanic_strategy'])
+            
+            # Run the volcanic strategy
+            volcanic_orders, _ = self.volcanic_strategy.run(state)
+            
+            # Add volcanic orders to overall orders
+            for product, product_orders in volcanic_orders.items():
+                if product not in orders:
+                    orders[product] = []
+                orders[product].extend(product_orders)
+                handled_products.add(product)
+            
+            # Save strategy state
+            new_trader_data['volcanic_strategy'] = self.volcanic_strategy.save()
+        
+        # Save trader data for next round
+        trader_data = jsonpickle.encode(new_trader_data)
+        
+        # Log the trading activity
+        self.logger.flush(state, orders, conversions, trader_data)
+
+        return orders, conversions, trader_data
